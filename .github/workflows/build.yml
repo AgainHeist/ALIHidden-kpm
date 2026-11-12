@@ -1,1 +1,45 @@
 
+name: build-all
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  kpm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y git make bc clang lld llvm cpio
+      - run: |
+          git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
+          cd kp && chmod +x build.sh && ./build.sh
+      - run: make -C kpm KP_DIR="$PWD/kp" ARCH=arm64 CC=clang LLVM=1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ALiHidden-kpm
+          path: "**/*.kpm"
+
+  zygisk:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "ndk;26.1.10909125"
+      - run: |
+          curl -sL -o zygisk/zygisk.hpp \
+            https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp
+      - run: |
+          cd zygisk
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4
+      - run: |
+          mkdir -p out && cp zygisk/build/libaliprop.so out/
+          cp zygisk/module/module.prop zygisk/module/customize.sh out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ALiProp-zygisk
+          path: out/
