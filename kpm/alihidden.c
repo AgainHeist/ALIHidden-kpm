@@ -1,5 +1,5 @@
 // ============================================================
-//  ALiHidden — stealth memory KPM / LKM   v11
+//  ALiHidden — stealth memory KPM / LKM   v12
 //  Owner By ALi
 //  Target : DarkXKernal (com.dts.freefiremax)
 //  Build  : KPM default  [LKM ke liye -DALIHIDDEN_LKM]
@@ -14,37 +14,43 @@
 #include <kpmodule.h>
 #include <kputils.h>
 
-#include <linux/module.h>
+#include <linux/types.h>
+#include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/printk.h>
-#include <linux/fs.h>
-#include <linux/miscdevice.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/fs.h>
+#include <linux/path.h>
+#include <linux/namei.h>
+#include <linux/dcache.h>
+#include <linux/mount.h>
+#include <linux/stat.h>
+#include <linux/statfs.h>
+#include <linux/miscdevice.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/pid.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/percpu.h>
 #include <linux/utsname.h>
-#include <linux/string.h>
 #include <linux/seq_file.h>
 #include <linux/kprobes.h>
-#include <linux/dcache.h>
-#include <linux/stat.h>
-#include <linux/statfs.h>
-#include <linux/namei.h>
+#include <linux/ptrace.h>
 #include <linux/fsuid.h>
 #include <linux/cred.h>
-#include <linux/mount.h>
 #include <linux/err.h>
-#include <linux/ptrace.h>
+#ifndef KPM
+#include <linux/module.h>
+#endif
 #ifdef CONFIG_COMPAT
 #include <linux/compat.h>
 #endif
 
 #ifdef KPM
 KPM_NAME("ALiHidden");
-KPM_VERSION("11.0.0");
+KPM_VERSION("12.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ALi");
 KPM_DESCRIPTION("system memory service");
