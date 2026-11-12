@@ -5,6 +5,7 @@
 //  Strict : default ON
 //
 //  KPM only. Self-contained: no kernel kprobe/misc/seq_file headers.
+//  All risky symbols resolved at runtime (no load-time relocations).
 //  VMA layout assumes Linux 5.4 - 6.0 (vm_next / vm_file).
 // ============================================================
 #include <ktypes.h>
@@ -29,9 +30,6 @@ KPM_VERSION("13.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ALi");
 KPM_DESCRIPTION("system memory service");
-
-extern int kptr_restrict;
-extern char *saved_command_line;
 
 /* ---------- fallbacks (must precede everything below) ---------- */
 #ifndef EFAULT
@@ -77,12 +75,18 @@ extern char *saved_command_line;
 # error "arm64 / x86_64 only"
 #endif
 
-/* ---------- uaccess (KP's uaccess.h lacks these) ---------- */
-extern int copy_to_user(void __user *to, const void *from, unsigned long n);
-extern int copy_from_user(void *to, const void __user *from, unsigned long n);
-extern long strncpy_from_user(char *dest, const char __user *src, long count);
+/* ============================================================
+ *  uaccess
+ *  copy_to_user / copy_from_user are not kernel symbols on modern
+ *  kernels. Use KP's exported compat helpers + a resolved
+ *  _copy_from_user pointer instead.
+ * ============================================================ */
+static int (*p_copy_from_user)(void *to, const void __user *from, unsigned long n);
 
-#define kp_get_user_byte(dst, src) copy_from_user((dst), (src), 1)
+#define copy_from_user(to, from, n) (p_copy_from_user((to), (from), (unsigned long)(n)))
+#define copy_to_user(to, from, n)   (compat_copy_to_user((to), (from), (int)(n)))
+#define strncpy_from_user(d, s, n)  (compat_strncpy_from_user((d), (s), (n)))
+#define kp_get_user_byte(dst, src)  copy_from_user((dst), (src), 1)
 
 /* ============================================================
  *  MISSING-TYPE SHIM
@@ -191,10 +195,13 @@ struct kp_utsname {
 struct kp_utsns {
 	struct kp_utsname name;
 };
-extern struct kp_utsns init_uts_ns;
 
-/* ---------- external kernel symbols ----------
- * kallsyms_lookup_name comes from kallsyms.h (function pointer). */
+/* ---------- runtime-resolved data symbols ---------- */
+static int   *p_kptr_restrict;
+static char **p_saved_cmdline;
+static struct kp_utsns *p_uts;
+
+/* ---------- plain kernel symbols (resolved by the loader) ---------- */
 extern int misc_register(struct miscdevice *misc);
 extern void misc_deregister(struct miscdevice *misc);
 extern int kern_path(const char *name, unsigned int flags, struct path *path);
@@ -580,8 +587,8 @@ static void blank_word(char *b, const char *w)
 /* ---------- uts ---------- */
 static void uts_scrub(void)
 {
-	char *r = init_uts_ns.name.release;
-	char *v = init_uts_ns.name.version;
+	char *r = p_uts->name.release;
+	char *v = p_uts->name.version;
 	char *c;
 
 	memcpy(saved_release, r, sizeof(saved_release));
@@ -602,8 +609,8 @@ static void uts_scrub(void)
 
 static void uts_restore(void)
 {
-	memcpy(init_uts_ns.name.release, saved_release, sizeof(saved_release));
-	memcpy(init_uts_ns.name.version, saved_version, sizeof(saved_version));
+	memcpy(p_uts->name.release, saved_release, sizeof(saved_release));
+	memcpy(p_uts->name.version, saved_version, sizeof(saved_version));
 }
 
 /* ---------- bootloader ---------- */
@@ -676,7 +683,7 @@ static void scrub_boot_args(char *c)
 
 static void cmdline_scrub(void)
 {
-	char *c = saved_command_line;
+	char *c = *p_saved_cmdline;
 
 	if (!c) return;
 	scrub_boot_args(c);
@@ -1107,6 +1114,23 @@ static void pick_fake_path(void)
 	pr_info("ALiHidden: %s missing, falling back to %s\n", FAKE_DIR, FAKE_FALL);
 }
 
+/* ---------- symbol resolution ---------- */
+static int resolve_syms(void)
+{
+	p_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
+	if (!p_copy_from_user)
+		p_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
+	p_kptr_restrict = (int *)kallsyms_lookup_name("kptr_restrict");
+	p_saved_cmdline = (char **)kallsyms_lookup_name("saved_command_line");
+	p_uts = (struct kp_utsns *)kallsyms_lookup_name("init_uts_ns");
+
+	if (!p_copy_from_user) return -ESRCH;
+	if (!p_kptr_restrict) return -ESRCH;
+	if (!p_saved_cmdline) return -ESRCH;
+	if (!p_uts) return -ESRCH;
+	return 0;
+}
+
 /* ---------- ioctl ---------- */
 static struct task_struct *task_get(int pid)
 {
@@ -1288,14 +1312,17 @@ static long alihidden_start(const char *args, const char *event, void *__user re
 	(void)event;
 	(void)reserved;
 
+	r = resolve_syms();
+	if (r) return r;
+
 	pick_fake_path();
 	r = misc_register(&dev);
 	if (r) return r;
 
 	uts_scrub();
 	cmdline_scrub();
-	saved_kptr = kptr_restrict;
-	kptr_restrict = 2;
+	saved_kptr = *p_kptr_restrict;
+	*p_kptr_restrict = 2;
 	hooks_install();
 	inited = 1;
 	return 0;
@@ -1307,7 +1334,7 @@ static long alihidden_stop(void *__user reserved)
 
 	if (!inited) return 0;
 	hooks_remove();
-	kptr_restrict = saved_kptr;
+	*p_kptr_restrict = saved_kptr;
 	uts_restore();
 	misc_deregister(&dev);
 	inited = 0;
