@@ -9,7 +9,18 @@ kpm:
           sudo apt-get install -y make git gcc-aarch64-linux-gnu
 
       - name: fetch KernelPatch
-        run: git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
+        run: |
+          git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
+          ls kp/kernel/include/kpmodule.h
+          ls kp/kernel/patch/include/kputils.h
+          ls kp/kernel/linux/include/linux/module.h
+
+      - name: preflight
+        run: |
+          for f in kpm/alihidden.c kpm/alihidden.lds kpm/Makefile; do
+            [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
+          done
+          grep -q 'kpatch.mk' kpm/Makefile && echo "WARN: Makefile me kpatch.mk bacha hua hai"
 
       - name: build KPM
         run: |
