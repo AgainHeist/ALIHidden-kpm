@@ -1,11 +1,4 @@
-name: build-all
-on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch:
-
-jobs:
-  kpm:
+kpm:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -13,85 +6,20 @@ jobs:
       - name: toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y git make bc clang lld llvm cpio \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          sudo apt-get install -y make git gcc-aarch64-linux-gnu
 
       - name: fetch KernelPatch
-        run: |
-          set -x
-          git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp || exit 1
-          echo "=== root listing ==="
-          ls -la kp
-          echo "=== kpatch.mk / build scripts ==="
-          find kp -maxdepth 4 \( -name 'kpatch.mk' -o -name 'build*.sh' -o -name '*.mk' \) -print
-
-      - name: optional host tools
-        run: |
-          cd kp
-          for s in build.sh scripts/build.sh; do
-            if [ -f "$s" ]; then echo "running $s"; chmod +x "$s" && ./"$s" || echo "warn: $s failed, continuing"; fi
-          done
+        run: git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
 
       - name: build KPM
         run: |
           set -x
-          MK=$(find kp -name 'kpatch.mk' | head -n1)
-          if [ -z "$MK" ]; then
-            echo "::error::kpatch.mk mila hi nahi — repo restructure hua hai, neeche template use karo"
-            find kp -maxdepth 3 -type d | head -50
-            exit 1
-          fi
-          KP="$(cd "$(dirname "$MK")" && pwd)"
-          echo "KP_DIR=$KP"
-          make -C kpm KP_DIR="$KP" ARCH=arm64 CC=clang LD=ld.lld
+          make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu-
           ls -la kpm
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ALiHidden-kpm
-          path: |
-            **/*.kpm
-            kpm/*.log
+          path: "**/*.kpm"
           if-no-files-found: warn
-
-  zygisk:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: android-actions/setup-android@v3
-
-      - name: ndk
-        run: |
-          sdkmanager "ndk;26.1.10909125"
-          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> $GITHUB_ENV
-
-      - name: zygisk.hpp
-        run: |
-          set -x
-          curl -fsSL -o zygisk/zygisk.hpp \
-            https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp
-          head -5 zygisk/zygisk.hpp
-
-      - name: build
-        run: |
-          set -x
-          cd zygisk
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j4
-
-      - name: package
-        run: |
-          mkdir -p out
-          cp zygisk/build/libaliprop.so out/
-          cp zygisk/module/module.prop zygisk/module/customize.sh out/
-          ls -la out
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ALiProp-zygisk
-          path: out/
