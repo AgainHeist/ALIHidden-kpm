@@ -1,13 +1,22 @@
-
 // ============================================================
-//  ALiHidden — stealth memory KPM / LKM   v10 FINAL
+//  ALiHidden — stealth memory KPM / LKM   v11
 //  Owner By ALi
 //  Target : DarkXKernal (com.dts.freefiremax)
-//  Build  : -DKPM (APatch KernelPatch)  [bina -DKPM = LKM]
+//  Build  : KPM default  [LKM ke liye -DALIHIDDEN_LKM]
 //  Strict : default ON — root bhi kuch nahi dekhta
 // ============================================================
+#ifndef ALIHIDDEN_LKM
+#define KPM 1
+#endif
+
+#include <compiler.h>
+#include <common.h>
+#include <kpmodule.h>
+#include <kputils.h>
+
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/printk.h>
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
@@ -28,36 +37,34 @@
 #include <linux/cred.h>
 #include <linux/mount.h>
 #include <linux/err.h>
-#include <linux/version.h>
 #include <linux/ptrace.h>
 #ifdef CONFIG_COMPAT
 #include <linux/compat.h>
 #endif
 
 #ifdef KPM
-#include <kpatch.h>
 KPM_NAME("ALiHidden");
-KPM_VERSION("10.0.0");
+KPM_VERSION("11.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ALi");
 KPM_DESCRIPTION("system memory service");
-extern int kptr_restrict;
 #endif
 
+extern int kptr_restrict;
 extern char *saved_command_line;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,3,0)
-static ssize_t strscpy(char *d, const char *s, size_t c)
+/* ---------- portable helpers ---------- */
+static ssize_t kp_strscpy(char *d, const char *s, size_t c)
 {
 	size_t i;
+
+	if (!c) return -E2BIG;
 	for (i = 0; i + 1 < c && s[i]; i++) d[i] = s[i];
-	if (c) d[i] = '\0';
+	d[i] = '\0';
 	return (ssize_t)i;
 }
-#endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)
-static void *memmem(const void *h, size_t hl, const void *n, size_t nl)
+static void *kp_memmem(const void *h, size_t hl, const void *n, size_t nl)
 {
 	const char *p = h, *end = p + hl;
 	const char *nd = n;
@@ -71,15 +78,6 @@ static void *memmem(const void *h, size_t hl, const void *n, size_t nl)
 	}
 	return NULL;
 }
-#endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,8,0)
-# define MM_RLOCK(mm)   down_read(&(mm)->mmap_sem)
-# define MM_RUNLOCK(mm) up_read(&(mm)->mmap_sem)
-#else
-# define MM_RLOCK(mm)   mmap_read_lock(mm)
-# define MM_RUNLOCK(mm) mmap_read_unlock(mm)
-#endif
 
 #define WANT_READDIR     1
 #define WANT_MAPS        1
@@ -113,7 +111,7 @@ static void *memmem(const void *h, size_t hl, const void *n, size_t nl)
 #define OP_BASE    0x803
 #define OP_STRICT  0x804
 #define OP_VER     0x805
-#define API_VER    10
+#define API_VER    11
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     96
@@ -134,7 +132,7 @@ static char saved_release[__NEW_UTS_LEN + 1];
 static char saved_version[__NEW_UTS_LEN + 1];
 static int  saved_kptr;
 static bool inited;
-static bool strict = true;          /* DEFAULT ON */
+static bool strict = true;
 static const char *fake_path = FAKE_FALL;
 
 static bool bypass(void)
@@ -143,14 +141,12 @@ static bool bypass(void)
 }
 
 static const char *const hidden[] = {
-	/* root frameworks */
 	"/data/adb", "/sbin/su", "/system/bin/su", "/system/xbin/su",
 	"/vendor/bin/su", "/system/bin/.ext", "/debug_ramdisk",
 	"/sbin/.magisk", "/system/bin/magisk", "/system/bin/ksud",
 	"/system/bin/apd", "/system/etc/init/magisk",
 	"/system/etc/init/init.magisk.rc", "/system/app/Magisk",
 	"/cache/magisk.log", "/data/magisk",
-	/* manager app data */
 	"/data/data/com.topjohnwu.magisk",
 	"/data/user/0/com.topjohnwu.magisk",
 	"/data/user_de/0/com.topjohnwu.magisk",
@@ -160,7 +156,6 @@ static const char *const hidden[] = {
 	"/data/data/me.bmax.apatch",
 	"/data/user/0/me.bmax.apatch",
 	"/data/user_de/0/me.bmax.apatch",
-	/* ours + misc */
 	"/data/local/tmp", "/proc/config.gz", "/sys/module/alihidden",
 };
 #define HIDDEN_N ARRAY_SIZE(hidden)
@@ -224,7 +219,7 @@ static bool text_blocked(const char *s, size_t len)
 	for (i = 0; i < BLK_T; i++) {
 		size_t n = strlen(blk_text[i]);
 		if (n > len) continue;
-		if (memmem(s, len, blk_text[i], n)) return true;
+		if (kp_memmem(s, len, blk_text[i], n)) return true;
 	}
 	return false;
 }
@@ -393,7 +388,7 @@ static int name_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct filename *fn = (struct filename *)P_RET(regs);
 
 	if (d->hide && fn && !IS_ERR(fn) && fn->name)
-		strscpy((char *)fn->name, fake_path, PATH_MAX);
+		kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
 	return 0;
 }
 
@@ -407,7 +402,7 @@ static int pre_path(struct kprobe *p, struct pt_regs *regs)
 	fn = (struct filename *)P_ARG1(regs);
 	if (!fn || !fn->name) return 0;
 	if (is_hidden(fn->name))
-		strscpy((char *)fn->name, fake_path, PATH_MAX);
+		kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
 	return 0;
 }
 
@@ -579,7 +574,7 @@ static int tr_entry_maps(struct kretprobe_instance *ri, struct pt_regs *regs)
 #if WANT_TRACER
 static void zero_tracer(char *buf, size_t start, size_t end)
 {
-	char *p = memmem(buf + start, end - start, "TracerPid:", 10);
+	char *p = kp_memmem(buf + start, end - start, "TracerPid:", 10);
 
 	if (!p) return;
 	p += 10;
@@ -835,14 +830,12 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		put_task_struct(tsk);
 		if (!mm) return -ESRCH;
 
-		MM_RLOCK(mm);
 		for (vma = mm->mmap; vma; vma = vma->vm_next) {
 			const char *dn;
 			if (!vma->vm_file || !vma->vm_file->f_path.dentry) continue;
 			dn = vma->vm_file->f_path.dentry->d_name.name;
 			if (dn && strstr(dn, pname)) { found = vma->vm_start; break; }
 		}
-		MM_RUNLOCK(mm);
 		mmput(mm);
 
 		mb.base = found;
@@ -912,11 +905,7 @@ static struct miscdevice dev = {
 	.mode  = 0666,
 };
 
-#ifdef KPM
-int kpm_init(void)
-#else
-static int __init alihidden_init(void)
-#endif
+static long alihidden_start(const char *args, const char *event, void *__user reserved)
 {
 	int r;
 
@@ -933,24 +922,23 @@ static int __init alihidden_init(void)
 	return 0;
 }
 
-#ifdef KPM
-void kpm_exit(void)
-#else
-static void __exit alihidden_exit(void)
-#endif
+static long alihidden_stop(void *__user reserved)
 {
-	if (!inited) return;
+	if (!inited) return 0;
 	hooks_remove();
 	kptr_restrict = saved_kptr;
 	uts_restore();
 	misc_deregister(&dev);
 	inited = false;
+	return 0;
 }
 
 #ifdef KPM
-KPM_INIT(kpm_init);
-KPM_EXIT(kpm_exit);
+KPM_INIT(alihidden_start);
+KPM_EXIT(alihidden_stop);
 #else
+static int __init alihidden_init(void) { return (int)alihidden_start(NULL, NULL, NULL); }
+static void __exit alihidden_exit(void) { alihidden_stop(NULL); }
 module_init(alihidden_init);
 module_exit(alihidden_exit);
 MODULE_LICENSE("GPL");
