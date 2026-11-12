@@ -20,6 +20,7 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
           ls kp/kernel/include/kpmodule.h
+          ls kp/kernel/include/ktypes.h
 
       - name: build
         run: |
