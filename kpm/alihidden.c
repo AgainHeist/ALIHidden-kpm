@@ -1,27 +1,364 @@
 // ============================================================
-//  ALiHidden — stealth memory KPM / LKM   v13
+//  ALiHidden — stealth memory KPM   v13
 //  Owner By ALi
 //  Target : DarkXKernal (com.dts.freefiremax)
 //  Strict : default ON
+//
+//  Build: KPM only (self-contained, no kernel kprobe headers)
+//  VMA layout assumes Linux 5.4 - 6.0 (vm_next / vm_file).
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
 #include <common.h>
 #include <kpmodule.h>
 #include <kputils.h>
+#include <hook.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/ptrace.h>
+#include <linux/uaccess.h>
 
-#ifdef KPM
+#ifndef KPM
+#define KPM 1
+#endif
+
 KPM_NAME("ALiHidden");
 KPM_VERSION("13.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ALi");
 KPM_DESCRIPTION("system memory service");
-#endif
 
 extern int kptr_restrict;
 extern char *saved_command_line;
+
+/* ============================================================
+ *  MISSING-TYPE SHIM
+ *  KernelPatch fake headers do not provide any of this, so we
+ *  declare it here. Nothing below is a duplicate definition.
+ * ============================================================ */
+
+struct module;
+struct inode;
+struct vfsmount;
+struct pid;
+
+struct list_head {
+	struct list_head *next, *prev;
+};
+
+struct qstr {
+	unsigned int hash;
+	unsigned int len;
+	const unsigned char *name;
+};
+
+struct hlist_bl_node {
+	struct hlist_bl_node *next, **pprev;
+};
+
+struct dentry {
+	unsigned int d_flags;
+	unsigned int d_seq;              /* seqcount_t */
+	struct hlist_bl_node d_hash;
+	struct dentry *d_parent;
+	struct qstr d_name;
+};
+
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
+};
+
+struct file {
+	struct path f_path;
+};
+
+struct file_operations {
+	struct module *owner;
+	loff_t (*llseek)(struct file *, loff_t, int);
+	ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
+	ssize_t (*read_iter)(void *, void *);
+	ssize_t (*write_iter)(void *, void *);
+	int (*iopoll)(void *, void *, int);
+	int (*iterate)(struct file *, struct dir_context *);
+	int (*iterate_shared)(struct file *, struct dir_context *);
+	unsigned int (*poll)(struct file *, void *);
+	long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
+};
+
+struct miscdevice {
+	int minor;
+	const char *name;
+	const struct file_operations *fops;
+	struct list_head list;
+	void *parent;
+	void *this_device;
+	const void *groups;
+	umode_t mode;
+};
+
+struct seq_file {
+	char *buf;
+	size_t size;
+	size_t from;
+	size_t count;
+};
+
+struct kstatfs {
+	long f_type;
+	long f_bsize;
+};
+
+struct task_struct;
+
+struct vm_area_struct {
+	unsigned long vm_start;
+	unsigned long vm_end;
+	struct vm_area_struct *vm_next;
+	struct vm_area_struct *vm_prev;
+	void *vm_rb[3];
+	struct list_head anon_vma_chain;
+	void *anon_vma;
+	const void *vm_ops;
+	unsigned long vm_pgoff;
+	struct file *vm_file;
+};
+
+struct mm_struct {
+	struct vm_area_struct *mmap;
+};
+
+#define __NEW_UTS_LEN 64
+struct kp_utsname {
+	char sysname[__NEW_UTS_LEN + 1];
+	char nodename[__NEW_UTS_LEN + 1];
+	char release[__NEW_UTS_LEN + 1];
+	char version[__NEW_UTS_LEN + 1];
+	char machine[__NEW_UTS_LEN + 1];
+	char domainname[__NEW_UTS_LEN + 1];
+};
+struct kp_utsns {
+	struct kp_utsname name;
+};
+extern struct kp_utsns init_uts_ns;
+
+/* ---------- external kernel symbols ---------- */
+extern unsigned long kallsyms_lookup_name(const char *name);
+extern int misc_register(struct miscdevice *misc);
+extern void misc_deregister(struct miscdevice *misc);
+extern int kern_path(const char *name, unsigned int flags, struct path *path);
+extern void path_put(const struct path *path);
+extern struct pid *find_vpid(int nr);
+extern struct task_struct *pid_task(struct pid *pid, int type);
+extern struct mm_struct *get_task_mm(struct task_struct *task);
+extern void mmput(struct mm_struct *mm);
+extern void get_task_struct(struct task_struct *t);
+extern void put_task_struct(struct task_struct *t);
+extern void *kvmalloc(unsigned long size, int flags);
+extern void kvfree(void *ptr);
+extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
+			     void *buf, int len, int write);
+extern loff_t no_llseek(struct file *file, loff_t offset, int whence);
+
+/* ---------- constants ---------- */
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xcc0
+#endif
+#ifndef FOLL_WRITE
+#define FOLL_WRITE 0x01
+#endif
+#ifndef FOLL_FORCE
+#define FOLL_FORCE 0x08
+#endif
+#ifndef LOOKUP_FOLLOW
+#define LOOKUP_FOLLOW 0x0001
+#endif
+#ifndef LOOKUP_DIRECTORY
+#define LOOKUP_DIRECTORY 0x0004
+#endif
+#ifndef PIDTYPE_PID
+#define PIDTYPE_PID 0
+#endif
+#ifndef MISC_DYNAMIC_MINOR
+#define MISC_DYNAMIC_MINOR 255
+#endif
+
+/* ============================================================
+ *  kprobe / kretprobe on top of KP inline hooks
+ * ============================================================ */
+struct kprobe;
+typedef int (*kprobe_pre_handler_t)(struct kprobe *, struct pt_regs *);
+typedef void (*kprobe_post_handler_t)(struct kprobe *, struct pt_regs *, unsigned long);
+
+struct kprobe {
+	const char *symbol_name;
+	kprobe_pre_handler_t pre_handler;
+	kprobe_post_handler_t post_handler;
+	void *addr;
+	int hooked;
+};
+
+struct kretprobe_instance {
+	void *data;
+};
+
+struct kretprobe;
+typedef int (*kretprobe_entry_handler_t)(struct kretprobe_instance *, struct pt_regs *);
+typedef int (*kretprobe_handler_t)(struct kretprobe_instance *, struct pt_regs *);
+
+struct kretprobe {
+	struct kprobe kp;
+	kretprobe_entry_handler_t entry_handler;
+	kretprobe_handler_t handler;
+	int data_size;
+	int maxactive;
+	int hooked;
+};
+
+/* hook_local_t gives 64 bytes per invocation; keep the last
+ * 8 bytes as the "run return handler" flag. */
+#define KRET_DATA_MAX 56
+
+#ifndef regs_return_value
+#define regs_return_value(r) P_RET(r)
+#endif
+
+#if defined(__aarch64__)
+static void regs_in(struct pt_regs *r, hook_fargs4_t *f)
+{
+	memset(r, 0, sizeof(*r));
+	r->regs[0] = f->arg0;
+	r->regs[1] = f->arg1;
+	r->regs[2] = f->arg2;
+	r->regs[3] = f->arg3;
+}
+static void regs_out(hook_fargs4_t *f, struct pt_regs *r)
+{
+	f->arg0 = r->regs[0];
+	f->arg1 = r->regs[1];
+	f->arg2 = r->regs[2];
+	f->arg3 = r->regs[3];
+}
+#else
+static void regs_in(struct pt_regs *r, hook_fargs4_t *f)
+{
+	memset(r, 0, sizeof(*r));
+	r->di = f->arg0;
+	r->si = f->arg1;
+	r->dx = f->arg2;
+	r->cx = f->arg3;
+}
+static void regs_out(hook_fargs4_t *f, struct pt_regs *r)
+{
+	f->arg0 = r->di;
+	f->arg1 = r->si;
+	f->arg2 = r->dx;
+	f->arg3 = r->cx;
+}
+#endif
+
+static void kprobe_before(hook_fargs4_t *f, void *ud)
+{
+	struct kprobe *p = (struct kprobe *)ud;
+	struct pt_regs r;
+
+	if (!p->pre_handler) return;
+	regs_in(&r, f);
+	p->pre_handler(p, &r);
+	regs_out(f, &r);
+}
+
+static void kprobe_after(hook_fargs4_t *f, void *ud)
+{
+	struct kprobe *p = (struct kprobe *)ud;
+	struct pt_regs r;
+
+	if (!p->post_handler) return;
+	regs_in(&r, f);
+	P_RET(&r) = f->ret;
+	p->post_handler(p, &r, 0);
+	f->ret = P_RET(&r);
+	regs_out(f, &r);
+}
+
+static void kret_before(hook_fargs4_t *f, void *ud)
+{
+	struct kretprobe *kr = (struct kretprobe *)ud;
+	struct kretprobe_instance ri;
+	struct pt_regs r;
+
+	f->local.data[7] = 0;
+	if (!kr->entry_handler) return;
+	ri.data = f->local.data;
+	regs_in(&r, f);
+	f->local.data[7] = kr->entry_handler(&ri, &r) ? 1 : 0;
+	regs_out(f, &r);
+}
+
+static void kret_after(hook_fargs4_t *f, void *ud)
+{
+	struct kretprobe *kr = (struct kretprobe *)ud;
+	struct kretprobe_instance ri;
+	struct pt_regs r;
+
+	if (!f->local.data[7] || !kr->handler) return;
+	ri.data = f->local.data;
+	regs_in(&r, f);
+	P_RET(&r) = f->ret;
+	kr->handler(&ri, &r);
+	f->ret = P_RET(&r);
+	regs_out(f, &r);
+}
+
+static int register_kprobe(struct kprobe *p)
+{
+	unsigned long addr;
+
+	if (!p->symbol_name) return -EINVAL;
+	addr = kallsyms_lookup_name(p->symbol_name);
+	if (!addr) return -ESRCH;
+	p->addr = (void *)addr;
+	if (hook_wrap4(p->addr, kprobe_before, kprobe_after, p)) {
+		p->addr = 0;
+		return -EIO;
+	}
+	p->hooked = 1;
+	return 0;
+}
+
+static void unregister_kprobe(struct kprobe *p)
+{
+	if (!p->hooked) return;
+	hook_unwrap(p->addr, kprobe_before, kprobe_after);
+	p->hooked = 0;
+}
+
+static int register_kretprobe(struct kretprobe *kr)
+{
+	unsigned long addr;
+
+	if (!kr->kp.symbol_name) return -EINVAL;
+	if (kr->data_size > KRET_DATA_MAX) return -E2BIG;
+	addr = kallsyms_lookup_name(kr->kp.symbol_name);
+	if (!addr) return -ESRCH;
+	kr->kp.addr = (void *)addr;
+	if (hook_wrap4(kr->kp.addr, kret_before, kret_after, kr)) {
+		kr->kp.addr = 0;
+		return -EIO;
+	}
+	kr->hooked = 1;
+	return 0;
+}
+
+static void unregister_kretprobe(struct kretprobe *kr)
+{
+	if (!kr->hooked) return;
+	hook_unwrap(kr->kp.addr, kret_before, kret_after);
+	kr->hooked = 0;
+}
 
 /* ---------- fallbacks ---------- */
 #ifndef EFAULT
@@ -112,7 +449,7 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define API_VER    13
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
-#define PATH_S     96
+#define PATH_S     48
 #define FAKE_DIR   "/data/misc/.__np"
 #define FAKE_FALL  "/data/misc"
 
@@ -135,7 +472,7 @@ static const char *fake_path = FAKE_FALL;
 
 static int bypass(void)
 {
-	return current_fsuid().val == 0 && !strict;
+	return current_uid() == 0 && !strict;
 }
 
 static const char *const hidden[] = {
@@ -409,85 +746,85 @@ static int pre_path(struct kprobe *p, struct pt_regs *regs)
 /* ---------- readdir ---------- */
 #if WANT_READDIR
 struct shadow { struct dir_context dc; struct dir_context *orig; };
-static DEFINE_PER_CPU(struct shadow, g_sh);
+static struct shadow g_sh;
 
-static int filter_actor(struct dir_context *c, const char *name, int namlen,
-			loff_t off, u64 ino, unsigned type)
+static bool filter_actor(struct dir_context *c, const char *name, int namlen,
+			 loff_t off, u64 ino, unsigned type)
 {
-	struct shadow *s = this_cpu_ptr(&g_sh);
+	struct shadow *s = &g_sh;
 
 	(void)c;
 	s->dc.pos = off;
-	if (name_blocked(name, namlen)) { s->orig->pos = off; return 0; }
+	if (name_blocked(name, namlen)) { s->orig->pos = off; return false; }
 	return s->orig->actor(s->orig, name, namlen, off, ino, type);
 }
 
 static int pre_iterate(struct kprobe *p, struct pt_regs *regs)
 {
 	struct dir_context *ctx = (struct dir_context *)P_ARG1(regs);
-	struct shadow *s;
 
 	if (bypass()) return 0;
-	if (!ctx || !ctx->actor || ctx->actor == filter_actor) return 0;
+	if (!ctx || !ctx->actor) return 0;
+	if ((void *)ctx->actor == (void *)filter_actor) return 0;
+	if (g_sh.orig) return 0;              /* re-entered */
 
-	s = this_cpu_ptr(&g_sh);
-	s->orig = ctx;
-	memcpy(&s->dc, ctx, sizeof(*ctx));
-	s->dc.actor = filter_actor;
-	P_ARG1(regs) = (unsigned long)&s->dc;
+	g_sh.orig = ctx;
+	memcpy(&g_sh.dc, ctx, sizeof(*ctx));
+	g_sh.dc.actor = filter_actor;
+	P_ARG1(regs) = (unsigned long)&g_sh.dc;
 	return 0;
 }
 
 static void post_iterate(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
 {
 	struct dir_context *ctx = (struct dir_context *)P_ARG1(regs);
-	struct shadow *s = this_cpu_ptr(&g_sh);
 
-	if (!ctx || ctx != s->orig) return;
-	ctx->pos = s->dc.pos;
-	s->orig = NULL;
+	if (!ctx || ctx != g_sh.orig) return;
+	ctx->pos = g_sh.dc.pos;
+	g_sh.orig = NULL;
 }
 
 static struct kprobe kp_iter;
 #endif
 
 /* ---------- read scrub ---------- */
-static DEFINE_PER_CPU(int, g_pread);
-static struct kprobe kp_pread, kp_bprop;
+static struct kretprobe kr_pread, kr_bprop;
 
-static void pre_read(struct kprobe *p, struct pt_regs *regs)
+static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct file *f = (struct file *)P_ARG0(regs);
+	int *mode = (int *)ri->data;
 	const char *n;
 
-	this_cpu_write(g_pread, 0);
-	if (bypass()) return;
-	if (!f || !f->f_path.dentry) return;
+	*mode = 0;
+	if (bypass()) return 0;
+	if (!f || !f->f_path.dentry) return 0;
 	n = f->f_path.dentry->d_name.name;
-	if (!n) return;
+	if (!n) return 0;
 
-	if (!strncmp(n, "bootargs", 8)) { this_cpu_write(g_pread, 1); return; }
-	if (!strcmp(n, "build.prop")) { this_cpu_write(g_pread, 2); return; }
+	if (!strncmp(n, "bootargs", 8)) { *mode = 1; return 1; }
+	if (!strcmp(n, "build.prop")) { *mode = 2; return 1; }
 	if (!strcmp(n, "current")) {
 		const char *pn = f->f_path.dentry->d_parent ?
 			f->f_path.dentry->d_parent->d_name.name : NULL;
-		if (pn && !strcmp(pn, "attr")) this_cpu_write(g_pread, 3);
-		return;
+		if (pn && !strcmp(pn, "attr")) { *mode = 3; return 1; }
+		return 0;
 	}
-	if (!strcmp(n, "enforce")) this_cpu_write(g_pread, 4);
+	if (!strcmp(n, "enforce")) { *mode = 4; return 1; }
+	return 0;
 }
 
-static void post_read(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
+static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	char __user *ub = (char __user *)P_ARG1(regs);
 	long ret = (long)regs_return_value(regs);
-	int mode = this_cpu_read(g_pread);
+	int mode = *(int *)ri->data;
 	char buf[1024];
 	long n;
 
-	if (!mode || ret <= 0) return;
+	if (!mode || ret <= 0) return 0;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
-	if (copy_from_user(buf, ub, n)) return;
+	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
 
 	switch (mode) {
@@ -495,36 +832,48 @@ static void post_read(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
 	case 2: scrub_buildprop(buf); break;
 	case 3: scrub_ctx(buf); break;
 	case 4: if (buf[0] == '0') buf[0] = '1'; break;
-	default: return;
+	default: return 0;
 	}
 	copy_to_user(ub, buf, n);
+	return 0;
 }
 
 /* ---------- statfs ---------- */
 #if WANT_STATFS
-static struct kprobe kp_statfs;
+static struct kretprobe kr_statfs;
 
-static void post_statfs(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
+static int entry_statfs(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	(void)ri;
+	(void)regs;
+	return 1;
+}
+
+static int post_statfs(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct kstatfs *st = (struct kstatfs *)P_ARG1(regs);
 
-	if (bypass() || !st) return;
+	(void)ri;
+	if (bypass() || !st) return 0;
 	if (st->f_type == OVERLAY_MAGIC) st->f_type = EXT4_MAGIC;
+	return 0;
 }
 #endif
 
 /* ---------- readlink ---------- */
 #if WANT_READLINK
-static DEFINE_PER_CPU(int, g_rl);
-static struct kprobe kp_rl;
+static struct kretprobe kr_rl;
 
-static int pre_rl(struct kprobe *p, struct pt_regs *regs)
+static int pre_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	this_cpu_write(g_rl, bypass() ? 0 : 1);
-	return 0;
+	int *on = (int *)ri->data;
+
+	(void)regs;
+	*on = bypass() ? 0 : 1;
+	return *on;
 }
 
-static void post_rl(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
+static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	static const char repl[] = "/dev/ashmem";
 	char __user *ub = (char __user *)P_ARG1(regs);
@@ -532,13 +881,14 @@ static void post_rl(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
 	char buf[64];
 	long n;
 
-	if (!this_cpu_read(g_rl) || ret <= 0) return;
+	if (!*(int *)ri->data || ret <= 0) return 0;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
-	if (copy_from_user(buf, ub, n)) return;
+	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
-	if (!strstr(buf, DEV_NAME)) return;
-	if (copy_to_user(ub, repl, sizeof(repl) - 1)) return;
+	if (!strstr(buf, DEV_NAME)) return 0;
+	if (copy_to_user(ub, repl, sizeof(repl) - 1)) return 0;
 	P_RET(regs) = (unsigned long)(sizeof(repl) - 1);
+	return 0;
 }
 #endif
 
@@ -562,14 +912,14 @@ static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (bypass()) return 0;
 	if (!m || !m->buf || m->size < m->count || m->size > 0x100000) return 0;
 	d->saved = (long)m->count;
-	return 0;
+	return 1;
 }
 
 static int tr_entry_maps(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	tr_entry(ri, regs);
 	((struct tr_data *)ri->data)->maps = 1;
-	return 0;
+	return 1;
 }
 
 #if WANT_TRACER
@@ -610,6 +960,7 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct seq_file *m = d->m;
 	long i, o, end;
 
+	(void)regs;
 	if (!d->saved || !m || (long)m->count <= d->saved) return 0;
 
 #if WANT_TRACER
@@ -666,13 +1017,27 @@ static void hooks_install(void)
 #if WANT_READDIR
 	hook_kp(&kp_iter, "iterate_dir", pre_iterate, post_iterate);
 #endif
-	hook_kp(&kp_pread, "proc_reg_read", pre_read, post_read);
-	hook_kp(&kp_bprop, "vfs_read", pre_read, post_read);
+	kr_pread.data_size = sizeof(int);
+	kr_bprop.data_size = sizeof(int);
+	kr_pread.entry_handler = pre_read;
+	kr_bprop.entry_handler = pre_read;
+	kr_pread.handler = post_read;
+	kr_bprop.handler = post_read;
+	hook_tr(&kr_pread, "proc_reg_read", 0);
+	hook_tr(&kr_bprop, "vfs_read", 0);
 #if WANT_STATFS
-	hook_kp(&kp_statfs, "vfs_statfs", NULL, post_statfs);
+	kr_statfs.data_size = 0;
+	kr_statfs.entry_handler = entry_statfs;
+	kr_statfs.handler = post_statfs;
+	kr_statfs.maxactive = 64;
+	if (register_kretprobe(&kr_statfs)) memset(&kr_statfs, 0, sizeof(kr_statfs));
 #endif
 #if WANT_READLINK
-	hook_kp(&kp_rl, "vfs_readlink", pre_rl, post_rl);
+	kr_rl.data_size = sizeof(int);
+	kr_rl.entry_handler = pre_rl;
+	kr_rl.handler = post_rl;
+	kr_rl.maxactive = 64;
+	if (register_kretprobe(&kr_rl)) memset(&kr_rl, 0, sizeof(kr_rl));
 #endif
 
 	hook_tr(&kr_mounts, "show_vfsmnt", 0);
@@ -691,30 +1056,30 @@ static void hooks_install(void)
 
 static void hooks_remove(void)
 {
-	if (kr_name.handler) unregister_kretprobe(&kr_name);
-	if (kp_path.pre_handler) unregister_kprobe(&kp_path);
+	if (kr_name.hooked) unregister_kretprobe(&kr_name);
+	if (kp_path.hooked) unregister_kprobe(&kp_path);
 #if WANT_READDIR
-	if (kp_iter.pre_handler) unregister_kprobe(&kp_iter);
+	if (kp_iter.hooked) unregister_kprobe(&kp_iter);
 #endif
-	if (kp_pread.pre_handler) unregister_kprobe(&kp_pread);
-	if (kp_bprop.pre_handler) unregister_kprobe(&kp_bprop);
+	if (kr_pread.hooked) unregister_kretprobe(&kr_pread);
+	if (kr_bprop.hooked) unregister_kretprobe(&kr_bprop);
 #if WANT_STATFS
-	if (kp_statfs.post_handler) unregister_kprobe(&kp_statfs);
+	if (kr_statfs.hooked) unregister_kretprobe(&kr_statfs);
 #endif
 #if WANT_READLINK
-	if (kp_rl.pre_handler) unregister_kprobe(&kp_rl);
+	if (kr_rl.hooked) unregister_kretprobe(&kr_rl);
 #endif
-	if (kr_mounts.handler) unregister_kretprobe(&kr_mounts);
-	if (kr_mountinfo.handler) unregister_kretprobe(&kr_mountinfo);
-	if (kr_modules.handler) unregister_kretprobe(&kr_modules);
-	if (kr_misc.handler) unregister_kretprobe(&kr_misc);
-	if (kr_fs.handler) unregister_kretprobe(&kr_fs);
-	if (kr_vm.handler) unregister_kretprobe(&kr_vm);
-	if (kr_status.handler) unregister_kretprobe(&kr_status);
+	if (kr_mounts.hooked) unregister_kretprobe(&kr_mounts);
+	if (kr_mountinfo.hooked) unregister_kretprobe(&kr_mountinfo);
+	if (kr_modules.hooked) unregister_kretprobe(&kr_modules);
+	if (kr_misc.hooked) unregister_kretprobe(&kr_misc);
+	if (kr_fs.hooked) unregister_kretprobe(&kr_fs);
+	if (kr_vm.hooked) unregister_kretprobe(&kr_vm);
+	if (kr_status.hooked) unregister_kretprobe(&kr_status);
 #if WANT_MAPS
-	if (kr_maps.handler) unregister_kretprobe(&kr_maps);
-	if (kr_smaps.handler) unregister_kretprobe(&kr_smaps);
-	if (kr_roll.handler) unregister_kretprobe(&kr_roll);
+	if (kr_maps.hooked) unregister_kretprobe(&kr_maps);
+	if (kr_smaps.hooked) unregister_kretprobe(&kr_smaps);
+	if (kr_roll.hooked) unregister_kretprobe(&kr_roll);
 #endif
 }
 
@@ -735,10 +1100,8 @@ static struct task_struct *task_get(int pid)
 {
 	struct task_struct *t;
 
-	rcu_read_lock();
 	t = pid_task(find_vpid(pid), PIDTYPE_PID);
 	if (t) get_task_struct(t);
-	rcu_read_unlock();
 	return t;
 }
 
@@ -770,6 +1133,7 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	int ret;
 	int c32 = 0;
 
+	(void)f;
 #ifdef CONFIG_COMPAT
 	c32 = in_compat_syscall();
 #endif
@@ -890,11 +1254,6 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 }
 
 static const struct file_operations dev_fops = {
-#ifdef KPM
-	.owner          = NULL,
-#else
-	.owner          = THIS_MODULE,
-#endif
 	.unlocked_ioctl = dev_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl   = dev_ioctl,
@@ -943,15 +1302,5 @@ static long alihidden_stop(void *__user reserved)
 	return 0;
 }
 
-#ifdef KPM
 KPM_INIT(alihidden_start);
 KPM_EXIT(alihidden_stop);
-#else
-static int __init alihidden_init(void) { return (int)alihidden_start(NULL, NULL, NULL); }
-static void __exit alihidden_exit(void) { alihidden_stop(NULL); }
-module_init(alihidden_init);
-module_exit(alihidden_exit);
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("ALi");
-MODULE_DESCRIPTION("system memory service");
-#endif
