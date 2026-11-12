@@ -4,8 +4,9 @@
 //  Target : DarkXKernal (com.dts.freefiremax)
 //  Strict : default ON
 //
-//  KPM only. Self-contained: no kernel kprobe/misc/seq_file headers.
-//  All risky symbols resolved at runtime (no load-time relocations).
+//  KPM only. Self-contained.
+//  EVERY external symbol is resolved at runtime -> no load-time
+//  data relocations, nothing to fail in the loader.
 //  VMA layout assumes Linux 5.4 - 6.0 (vm_next / vm_file).
 // ============================================================
 #include <ktypes.h>
@@ -31,7 +32,7 @@ KPM_LICENSE("GPL");
 KPM_AUTHOR("ALi");
 KPM_DESCRIPTION("system memory service");
 
-/* ---------- fallbacks (must precede everything below) ---------- */
+/* ---------- fallbacks ---------- */
 #ifndef EFAULT
 #define EFAULT 14
 #endif
@@ -60,7 +61,7 @@ KPM_DESCRIPTION("system memory service");
 #define IS_ERR(x) ((unsigned long)(x) >= (unsigned long)-4095UL)
 #endif
 
-/* ---------- register accessors (needed by the shim) ---------- */
+/* ---------- register accessors ---------- */
 #if defined(__aarch64__)
 # define P_ARG0(r) ((r)->regs[0])
 # define P_ARG1(r) ((r)->regs[1])
@@ -76,22 +77,7 @@ KPM_DESCRIPTION("system memory service");
 #endif
 
 /* ============================================================
- *  uaccess
- *  copy_to_user / copy_from_user are not kernel symbols on modern
- *  kernels. Use KP's exported compat helpers + a resolved
- *  _copy_from_user pointer instead.
- * ============================================================ */
-static int (*p_copy_from_user)(void *to, const void __user *from, unsigned long n);
-
-#define copy_from_user(to, from, n) (p_copy_from_user((to), (from), (unsigned long)(n)))
-#define copy_to_user(to, from, n)   (compat_copy_to_user((to), (from), (int)(n)))
-#define strncpy_from_user(d, s, n)  (compat_strncpy_from_user((d), (s), (n)))
-#define kp_get_user_byte(dst, src)  copy_from_user((dst), (src), 1)
-
-/* ============================================================
  *  MISSING-TYPE SHIM
- *  KernelPatch fake headers do not provide any of this, so we
- *  declare it here. struct list_head comes from ktypes.h.
  * ============================================================ */
 
 struct module;
@@ -111,7 +97,7 @@ struct hlist_bl_node {
 
 struct dentry {
 	unsigned int d_flags;
-	unsigned int d_seq;              /* seqcount_t */
+	unsigned int d_seq;
 	struct hlist_bl_node d_hash;
 	struct dentry *d_parent;
 	struct qstr d_name;
@@ -196,27 +182,33 @@ struct kp_utsns {
 	struct kp_utsname name;
 };
 
-/* ---------- runtime-resolved data symbols ---------- */
-static int   *p_kptr_restrict;
-static char **p_saved_cmdline;
-static struct kp_utsns *p_uts;
+/* ============================================================
+ *  runtime symbol table (nothing is linked against the kernel)
+ * ============================================================ */
+static int  (*k_misc_register)(struct miscdevice *);
+static void (*k_misc_deregister)(struct miscdevice *);
+static int  (*k_kern_path)(const char *, unsigned int, struct path *);
+static void (*k_path_put)(const struct path *);
+static struct pid *(*k_find_vpid)(int);
+static struct task_struct *(*k_pid_task)(struct pid *, int);
+static struct mm_struct *(*k_get_task_mm)(struct task_struct *);
+static void (*k_mmput)(struct mm_struct *);
+static void (*k_get_task_struct)(struct task_struct *);
+static void (*k_put_task_struct)(struct task_struct *);
+static void *(*k_kvmalloc)(unsigned long, int);
+static void (*k_kvfree)(void *);
+static int  (*k_access_process_vm)(struct task_struct *, unsigned long, void *, int, int);
+static loff_t (*k_no_llseek)(struct file *, loff_t, int);
+static int  (*k_copy_from_user)(void *, const void __user *, unsigned long);
+static int  *k_kptr_restrict;
+static char **k_saved_cmdline;
+static struct kp_utsns *k_uts;
 
-/* ---------- plain kernel symbols (resolved by the loader) ---------- */
-extern int misc_register(struct miscdevice *misc);
-extern void misc_deregister(struct miscdevice *misc);
-extern int kern_path(const char *name, unsigned int flags, struct path *path);
-extern void path_put(const struct path *path);
-extern struct pid *find_vpid(int nr);
-extern struct task_struct *pid_task(struct pid *pid, int type);
-extern struct mm_struct *get_task_mm(struct task_struct *task);
-extern void mmput(struct mm_struct *mm);
-extern void get_task_struct(struct task_struct *t);
-extern void put_task_struct(struct task_struct *t);
-extern void *kvmalloc(unsigned long size, int flags);
-extern void kvfree(void *ptr);
-extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
-			     void *buf, int len, int write);
-extern loff_t no_llseek(struct file *file, loff_t offset, int whence);
+#define copy_from_user(to, from, n) \
+	(k_copy_from_user ? k_copy_from_user((to), (from), (unsigned long)(n)) : -EFAULT)
+#define copy_to_user(to, from, n)   (compat_copy_to_user((to), (from), (int)(n)))
+#define strncpy_from_user(d, s, n)  (compat_strncpy_from_user((d), (s), (n)))
+#define kp_get_user_byte(dst, src)  copy_from_user((dst), (src), 1)
 
 /* ---------- constants ---------- */
 #ifndef GFP_KERNEL
@@ -273,8 +265,6 @@ struct kretprobe {
 	int hooked;
 };
 
-/* hook_local_t gives 64 bytes per invocation; keep the last
- * 8 bytes as the "run return handler" flag. */
 #define KRET_DATA_MAX 56
 
 #ifndef regs_return_value
@@ -375,7 +365,10 @@ static int register_kprobe(struct kprobe *p)
 	if (!p->symbol_name) return -EINVAL;
 	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(p->symbol_name);
-	if (!addr) return -ESRCH;
+	if (!addr) {
+		pr_info("ALiHidden: no symbol %s\n", p->symbol_name);
+		return -ESRCH;
+	}
 	p->addr = (void *)addr;
 	if (hook_wrap4(p->addr, kprobe_before, kprobe_after, p)) {
 		p->addr = 0;
@@ -400,7 +393,10 @@ static int register_kretprobe(struct kretprobe *kr)
 	if (kr->data_size > KRET_DATA_MAX) return -E2BIG;
 	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(kr->kp.symbol_name);
-	if (!addr) return -ESRCH;
+	if (!addr) {
+		pr_info("ALiHidden: no symbol %s\n", kr->kp.symbol_name);
+		return -ESRCH;
+	}
 	kr->kp.addr = (void *)addr;
 	if (hook_wrap4(kr->kp.addr, kret_before, kret_after, kr)) {
 		kr->kp.addr = 0;
@@ -587,8 +583,8 @@ static void blank_word(char *b, const char *w)
 /* ---------- uts ---------- */
 static void uts_scrub(void)
 {
-	char *r = p_uts->name.release;
-	char *v = p_uts->name.version;
+	char *r = k_uts->name.release;
+	char *v = k_uts->name.version;
 	char *c;
 
 	memcpy(saved_release, r, sizeof(saved_release));
@@ -609,8 +605,8 @@ static void uts_scrub(void)
 
 static void uts_restore(void)
 {
-	memcpy(p_uts->name.release, saved_release, sizeof(saved_release));
-	memcpy(p_uts->name.version, saved_version, sizeof(saved_version));
+	memcpy(k_uts->name.release, saved_release, sizeof(saved_release));
+	memcpy(k_uts->name.version, saved_version, sizeof(saved_version));
 }
 
 /* ---------- bootloader ---------- */
@@ -683,8 +679,10 @@ static void scrub_boot_args(char *c)
 
 static void cmdline_scrub(void)
 {
-	char *c = *p_saved_cmdline;
+	char *c;
 
+	if (!k_saved_cmdline) return;
+	c = *k_saved_cmdline;
 	if (!c) return;
 	scrub_boot_args(c);
 }
@@ -783,7 +781,7 @@ static int pre_iterate(struct kprobe *p, struct pt_regs *regs)
 	if (bypass()) return 0;
 	if (!ctx || !ctx->actor) return 0;
 	if ((void *)ctx->actor == (void *)filter_actor) return 0;
-	if (g_sh.orig) return 0;              /* re-entered */
+	if (g_sh.orig) return 0;
 
 	g_sh.orig = ctx;
 	memcpy(&g_sh.dc, ctx, sizeof(*ctx));
@@ -1106,8 +1104,9 @@ static void pick_fake_path(void)
 {
 	struct path p;
 
-	if (!kern_path(FAKE_DIR, LOOKUP_DIRECTORY | LOOKUP_FOLLOW, &p)) {
-		path_put(&p);
+	if (!k_kern_path || !k_path_put) return;
+	if (!k_kern_path(FAKE_DIR, LOOKUP_DIRECTORY | LOOKUP_FOLLOW, &p)) {
+		k_path_put(&p);
 		fake_path = FAKE_DIR;
 		return;
 	}
@@ -1115,19 +1114,39 @@ static void pick_fake_path(void)
 }
 
 /* ---------- symbol resolution ---------- */
+#define RS(name, slot)                                          \
+	do {                                                    \
+		*(void **)&(slot) = (void *)kallsyms_lookup_name(name); \
+		if (!(slot)) pr_info("ALiHidden: missing %s\n", name);  \
+	} while (0)
+
 static int resolve_syms(void)
 {
-	p_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
-	if (!p_copy_from_user)
-		p_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
-	p_kptr_restrict = (int *)kallsyms_lookup_name("kptr_restrict");
-	p_saved_cmdline = (char **)kallsyms_lookup_name("saved_command_line");
-	p_uts = (struct kp_utsns *)kallsyms_lookup_name("init_uts_ns");
+	if (!kallsyms_lookup_name) return -ESRCH;
 
-	if (!p_copy_from_user) return -ESRCH;
-	if (!p_kptr_restrict) return -ESRCH;
-	if (!p_saved_cmdline) return -ESRCH;
-	if (!p_uts) return -ESRCH;
+	RS("_copy_from_user", k_copy_from_user);
+	if (!k_copy_from_user)
+		RS("__arch_copy_from_user", k_copy_from_user);
+	RS("kptr_restrict", k_kptr_restrict);
+	RS("saved_command_line", k_saved_cmdline);
+	RS("init_uts_ns", k_uts);
+	RS("misc_register", k_misc_register);
+	RS("misc_deregister", k_misc_deregister);
+	RS("kern_path", k_kern_path);
+	RS("path_put", k_path_put);
+	RS("find_vpid", k_find_vpid);
+	RS("pid_task", k_pid_task);
+	RS("get_task_mm", k_get_task_mm);
+	RS("mmput", k_mmput);
+	RS("get_task_struct", k_get_task_struct);
+	RS("put_task_struct", k_put_task_struct);
+	RS("kvmalloc", k_kvmalloc);
+	RS("kvfree", k_kvfree);
+	RS("access_process_vm", k_access_process_vm);
+	RS("no_llseek", k_no_llseek);
+
+	if (!k_misc_register || !k_misc_deregister) return -ESRCH;
+	if (!k_copy_from_user) return -ESRCH;
 	return 0;
 }
 
@@ -1136,9 +1155,15 @@ static struct task_struct *task_get(int pid)
 {
 	struct task_struct *t;
 
-	t = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if (t) get_task_struct(t);
+	if (!k_find_vpid || !k_pid_task) return NULL;
+	t = k_pid_task(k_find_vpid(pid), PIDTYPE_PID);
+	if (t && k_get_task_struct) k_get_task_struct(t);
 	return t;
+}
+
+static void task_put(struct task_struct *t)
+{
+	if (t && k_put_task_struct) k_put_task_struct(t);
 }
 
 static void wb_size(unsigned long arg, int c32, unsigned long long sz)
@@ -1224,11 +1249,12 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		pname[sizeof(pname) - 1] = '\0';
 		if (!pname[0]) return -EINVAL;
+		if (!k_get_task_mm) return -ESRCH;
 
 		tsk = task_get(mb.pid);
 		if (!tsk) return -ESRCH;
-		mm = get_task_mm(tsk);
-		put_task_struct(tsk);
+		mm = k_get_task_mm(tsk);
+		task_put(tsk);
 		if (!mm) return -ESRCH;
 
 		for (vma = mm->mmap; vma; vma = vma->vm_next) {
@@ -1237,7 +1263,7 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			dn = vma->vm_file->f_path.dentry->d_name.name;
 			if (dn && strstr(dn, pname)) { found = vma->vm_start; break; }
 		}
-		mmput(mm);
+		if (k_mmput) k_mmput(mm);
 
 		mb.base = found;
 		if (c32) {
@@ -1260,13 +1286,19 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 	tsk = task_get(cm.pid);
 	if (!tsk) return -ESRCH;
+	if (!k_access_process_vm) { task_put(tsk); return -EIO; }
 
-	kbuf = cm.size <= SMALL_IO ? (void *)small : kvmalloc((unsigned long)cm.size, GFP_KERNEL);
-	if (!kbuf) { put_task_struct(tsk); return -ENOMEM; }
+	if (cm.size <= SMALL_IO) {
+		kbuf = (void *)small;
+	} else {
+		if (!k_kvmalloc) { task_put(tsk); return -ENOMEM; }
+		kbuf = k_kvmalloc((unsigned long)cm.size, GFP_KERNEL);
+		if (!kbuf) { task_put(tsk); return -ENOMEM; }
+	}
 
 	if (cmd == OP_READ) {
-		ret = access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
-					(int)cm.size, 0);
+		ret = k_access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
+					  (int)cm.size, 0);
 		if (ret > 0 &&
 		    copy_to_user((void __user *)(unsigned long)cm.buffer, kbuf, ret))
 			ret = -EFAULT;
@@ -1275,34 +1307,23 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 				   (unsigned long)cm.size)) {
 			ret = -EFAULT;
 		} else {
-			ret = access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
-						(int)cm.size, FOLL_WRITE | FOLL_FORCE);
+			ret = k_access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
+						  (int)cm.size,
+						  FOLL_WRITE | FOLL_FORCE);
 		}
 	} else {
 		ret = -EINVAL;
 	}
 
-	if (kbuf != (void *)small) kvfree(kbuf);
-	put_task_struct(tsk);
+	if (kbuf != (void *)small && k_kvfree) k_kvfree(kbuf);
+	task_put(tsk);
 
 	if (ret > 0) { wb_size(arg, c32, (unsigned long long)ret); return 0; }
 	return ret < 0 ? ret : -EIO;
 }
 
-static const struct file_operations dev_fops = {
-	.unlocked_ioctl = dev_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl   = dev_ioctl,
-#endif
-	.llseek         = no_llseek,
-};
-
-static struct miscdevice dev = {
-	.minor = MISC_DYNAMIC_MINOR,
-	.name  = DEV_NAME,
-	.fops  = &dev_fops,
-	.mode  = 0666,
-};
+static struct file_operations dev_fops;
+static struct miscdevice dev;
 
 static long alihidden_start(const char *args, const char *event, void *__user reserved)
 {
@@ -1313,18 +1334,40 @@ static long alihidden_start(const char *args, const char *event, void *__user re
 	(void)reserved;
 
 	r = resolve_syms();
-	if (r) return r;
+	if (r) {
+		pr_info("ALiHidden: resolve failed %d\n", r);
+		return r;
+	}
+
+	memset(&dev_fops, 0, sizeof(dev_fops));
+	dev_fops.unlocked_ioctl = dev_ioctl;
+#ifdef CONFIG_COMPAT
+	dev_fops.compat_ioctl = dev_ioctl;
+#endif
+	dev_fops.llseek = k_no_llseek;
+
+	memset(&dev, 0, sizeof(dev));
+	dev.minor = MISC_DYNAMIC_MINOR;
+	dev.name = DEV_NAME;
+	dev.fops = &dev_fops;
+	dev.mode = 0666;
 
 	pick_fake_path();
-	r = misc_register(&dev);
-	if (r) return r;
+	r = k_misc_register(&dev);
+	if (r) {
+		pr_info("ALiHidden: misc_register failed %d\n", r);
+		return r;
+	}
 
-	uts_scrub();
+	if (k_uts) uts_scrub();
 	cmdline_scrub();
-	saved_kptr = *p_kptr_restrict;
-	*p_kptr_restrict = 2;
+	if (k_kptr_restrict) {
+		saved_kptr = *k_kptr_restrict;
+		*k_kptr_restrict = 2;
+	}
 	hooks_install();
 	inited = 1;
+	pr_info("ALiHidden: loaded\n");
 	return 0;
 }
 
@@ -1334,9 +1377,9 @@ static long alihidden_stop(void *__user reserved)
 
 	if (!inited) return 0;
 	hooks_remove();
-	*p_kptr_restrict = saved_kptr;
-	uts_restore();
-	misc_deregister(&dev);
+	if (k_kptr_restrict) *k_kptr_restrict = saved_kptr;
+	if (k_uts) uts_restore();
+	if (k_misc_deregister) k_misc_deregister(&dev);
 	inited = 0;
 	return 0;
 }
