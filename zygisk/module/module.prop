@@ -1,1 +1,7 @@
 
+id=aliprop
+name=ALiProp
+version=v2.0
+versionCode=3
+author=ALi
+description=Fake ro.boot / ro.debuggable / ro.build.tags + hide manager packages
