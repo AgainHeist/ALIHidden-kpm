@@ -4,11 +4,12 @@
 //  Target : DarkXKernal (com.dts.freefiremax)
 //  Strict : default ON
 //
-//  Build: KPM only (self-contained, no kernel kprobe headers)
+//  KPM only. Self-contained: no kernel kprobe/misc/seq_file headers.
 //  VMA layout assumes Linux 5.4 - 6.0 (vm_next / vm_file).
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
+#include <stdbool.h>
 #include <common.h>
 #include <kpmodule.h>
 #include <kputils.h>
@@ -31,6 +32,57 @@ KPM_DESCRIPTION("system memory service");
 
 extern int kptr_restrict;
 extern char *saved_command_line;
+
+/* ---------- fallbacks (must precede everything below) ---------- */
+#ifndef EFAULT
+#define EFAULT 14
+#endif
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+#ifndef ESRCH
+#define ESRCH 3
+#endif
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef EIO
+#define EIO 5
+#endif
+#ifndef E2BIG
+#define E2BIG 7
+#endif
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+#ifndef IS_ERR
+#define IS_ERR(x) ((unsigned long)(x) >= (unsigned long)-4095UL)
+#endif
+
+/* ---------- register accessors (needed by the shim) ---------- */
+#if defined(__aarch64__)
+# define P_ARG0(r) ((r)->regs[0])
+# define P_ARG1(r) ((r)->regs[1])
+# define P_ARG2(r) ((r)->regs[2])
+# define P_RET(r)  ((r)->regs[0])
+#elif defined(__x86_64__)
+# define P_ARG0(r) ((r)->di)
+# define P_ARG1(r) ((r)->si)
+# define P_ARG2(r) ((r)->dx)
+# define P_RET(r)  ((r)->ax)
+#else
+# error "arm64 / x86_64 only"
+#endif
+
+/* ---------- uaccess (KP's uaccess.h lacks these) ---------- */
+extern int copy_to_user(void __user *to, const void *from, unsigned long n);
+extern int copy_from_user(void *to, const void __user *from, unsigned long n);
+extern long strncpy_from_user(char *dest, const char __user *src, long count);
+
+#define kp_get_user_byte(dst, src) copy_from_user((dst), (src), 1)
 
 /* ============================================================
  *  MISSING-TYPE SHIM
@@ -360,35 +412,7 @@ static void unregister_kretprobe(struct kretprobe *kr)
 	kr->hooked = 0;
 }
 
-/* ---------- fallbacks ---------- */
-#ifndef EFAULT
-#define EFAULT 14
-#endif
-#ifndef EINVAL
-#define EINVAL 22
-#endif
-#ifndef ESRCH
-#define ESRCH 3
-#endif
-#ifndef ENOMEM
-#define ENOMEM 12
-#endif
-#ifndef EIO
-#define EIO 5
-#endif
-#ifndef E2BIG
-#define E2BIG 7
-#endif
-#ifndef PATH_MAX
-#define PATH_MAX 4096
-#endif
-#ifndef ARRAY_SIZE
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-#endif
-#ifndef IS_ERR
-#define IS_ERR(x) ((unsigned long)(x) >= (unsigned long)-4095UL)
-#endif
-
+/* ---------- helpers ---------- */
 static long kp_strscpy(char *d, const char *s, long c)
 {
 	long i;
@@ -424,20 +448,6 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define WANT_BUILDPROP   1
 #define WANT_ATTR        1
 #define WANT_ENFORCE     1
-
-#if defined(__aarch64__)
-# define P_ARG0(r) ((r)->regs[0])
-# define P_ARG1(r) ((r)->regs[1])
-# define P_ARG2(r) ((r)->regs[2])
-# define P_RET(r)  ((r)->regs[0])
-#elif defined(__x86_64__)
-# define P_ARG0(r) ((r)->di)
-# define P_ARG1(r) ((r)->si)
-# define P_ARG2(r) ((r)->dx)
-# define P_RET(r)  ((r)->ax)
-#else
-# error "arm64 / x86_64 only"
-#endif
 
 #define DEV_NAME   "nvsvc"
 #define OP_INIT    0x800
@@ -712,7 +722,7 @@ static int name_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	d->hide = 0;
 	if (bypass()) return 1;
 	if (!u) return 1;
-	if (get_user(c, u) || c != '/') return 1;
+	if (kp_get_user_byte(&c, u) || c != '/') return 1;
 	if (strncpy_from_user(d->path, u, sizeof(d->path) - 1) < 0) return 1;
 	d->path[sizeof(d->path) - 1] = '\0';
 	d->hide = is_hidden(d->path);
@@ -735,6 +745,7 @@ static int pre_path(struct kprobe *p, struct pt_regs *regs)
 {
 	struct filename *fn;
 
+	(void)p;
 	if (bypass()) return 0;
 	fn = (struct filename *)P_ARG1(regs);
 	if (!fn || !fn->name) return 0;
@@ -763,6 +774,7 @@ static int pre_iterate(struct kprobe *p, struct pt_regs *regs)
 {
 	struct dir_context *ctx = (struct dir_context *)P_ARG1(regs);
 
+	(void)p;
 	if (bypass()) return 0;
 	if (!ctx || !ctx->actor) return 0;
 	if ((void *)ctx->actor == (void *)filter_actor) return 0;
@@ -779,6 +791,8 @@ static void post_iterate(struct kprobe *p, struct pt_regs *regs, unsigned long f
 {
 	struct dir_context *ctx = (struct dir_context *)P_ARG1(regs);
 
+	(void)p;
+	(void)fl;
 	if (!ctx || ctx != g_sh.orig) return;
 	ctx->pos = g_sh.dc.pos;
 	g_sh.orig = NULL;
