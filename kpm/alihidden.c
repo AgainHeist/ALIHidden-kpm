@@ -1,56 +1,20 @@
 // ============================================================
-//  ALiHidden — stealth memory KPM / LKM   v12
+//  ALiHidden — stealth memory KPM / LKM   v13
 //  Owner By ALi
 //  Target : DarkXKernal (com.dts.freefiremax)
-//  Build  : KPM default  [LKM ke liye -DALIHIDDEN_LKM]
-//  Strict : default ON — root bhi kuch nahi dekhta
+//  Strict : default ON
 // ============================================================
-#ifndef ALIHIDDEN_LKM
-#define KPM 1
-#endif
-
+#include <ktypes.h>
 #include <compiler.h>
 #include <common.h>
 #include <kpmodule.h>
 #include <kputils.h>
-
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <linux/kernel.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/uaccess.h>
-#include <linux/fs.h>
-#include <linux/path.h>
-#include <linux/namei.h>
-#include <linux/dcache.h>
-#include <linux/mount.h>
-#include <linux/stat.h>
-#include <linux/statfs.h>
-#include <linux/miscdevice.h>
-#include <linux/sched.h>
-#include <linux/sched/mm.h>
-#include <linux/pid.h>
-#include <linux/mm.h>
-#include <linux/slab.h>
-#include <linux/percpu.h>
-#include <linux/utsname.h>
-#include <linux/seq_file.h>
-#include <linux/kprobes.h>
-#include <linux/ptrace.h>
-#include <linux/fsuid.h>
-#include <linux/cred.h>
-#include <linux/err.h>
-#ifndef KPM
-#include <linux/module.h>
-#endif
-#ifdef CONFIG_COMPAT
-#include <linux/compat.h>
-#endif
 
 #ifdef KPM
 KPM_NAME("ALiHidden");
-KPM_VERSION("12.0.0");
+KPM_VERSION("13.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ALi");
 KPM_DESCRIPTION("system memory service");
@@ -59,30 +23,58 @@ KPM_DESCRIPTION("system memory service");
 extern int kptr_restrict;
 extern char *saved_command_line;
 
-/* ---------- portable helpers ---------- */
-static ssize_t kp_strscpy(char *d, const char *s, size_t c)
-{
-	size_t i;
+/* ---------- fallbacks ---------- */
+#ifndef EFAULT
+#define EFAULT 14
+#endif
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+#ifndef ESRCH
+#define ESRCH 3
+#endif
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef EIO
+#define EIO 5
+#endif
+#ifndef E2BIG
+#define E2BIG 7
+#endif
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+#ifndef IS_ERR
+#define IS_ERR(x) ((unsigned long)(x) >= (unsigned long)-4095UL)
+#endif
 
-	if (!c) return -E2BIG;
+static long kp_strscpy(char *d, const char *s, long c)
+{
+	long i;
+
+	if (c <= 0) return -E2BIG;
 	for (i = 0; i + 1 < c && s[i]; i++) d[i] = s[i];
 	d[i] = '\0';
-	return (ssize_t)i;
+	return i;
 }
 
-static void *kp_memmem(const void *h, size_t hl, const void *n, size_t nl)
+static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 {
 	const char *p = h, *end = p + hl;
 	const char *nd = n;
 
-	if (!nl || nl > hl) return NULL;
+	if (nl <= 0 || nl > hl) return 0;
 	while (p + nl <= end) {
 		p = memchr(p, nd[0], end - p - nl + 1);
-		if (!p) return NULL;
+		if (!p) return 0;
 		if (!memcmp(p, nd, nl)) return (void *)p;
 		p++;
 	}
-	return NULL;
+	return 0;
 }
 
 #define WANT_READDIR     1
@@ -117,7 +109,7 @@ static void *kp_memmem(const void *h, size_t hl, const void *n, size_t nl)
 #define OP_BASE    0x803
 #define OP_STRICT  0x804
 #define OP_VER     0x805
-#define API_VER    11
+#define API_VER    13
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     96
@@ -127,21 +119,21 @@ static void *kp_memmem(const void *h, size_t hl, const void *n, size_t nl)
 #define OVERLAY_MAGIC 0x794c7630U
 #define EXT4_MAGIC    0xef53U
 
-struct copy_mem { __s32 pid; __u32 pad; __u64 addr; __u64 buffer; __u64 size; };
-struct mod_base { __s32 pid; __u32 pad; __u64 name; __u64 base; };
+struct copy_mem { int pid; unsigned int pad; unsigned long long addr, buffer, size; };
+struct mod_base { int pid; unsigned int pad; unsigned long long name, base; };
 #ifdef CONFIG_COMPAT
-struct copy_mem32 { __s32 pid; __u32 addr; __u32 buffer; __u32 size; };
-struct mod_base32 { __s32 pid; __u32 name; __u32 base; };
+struct copy_mem32 { int pid; unsigned int addr, buffer, size; };
+struct mod_base32 { int pid; unsigned int name, base; };
 #endif
 
 static char saved_release[__NEW_UTS_LEN + 1];
 static char saved_version[__NEW_UTS_LEN + 1];
 static int  saved_kptr;
-static bool inited;
-static bool strict = true;
+static int  inited;
+static int  strict = 1;
 static const char *fake_path = FAKE_FALL;
 
-static bool bypass(void)
+static int bypass(void)
 {
 	return current_fsuid().val == 0 && !strict;
 }
@@ -187,52 +179,54 @@ static const char *const blk_text[] = {
 };
 #define BLK_T ARRAY_SIZE(blk_text)
 
-static bool is_hidden(const char *p)
+static int is_hidden(const char *p)
 {
 	unsigned int i;
-	size_t n;
+	long n;
 
-	if (!p || p[0] != '/') return false;
+	if (!p || p[0] != '/') return 0;
 	for (i = 0; i < HIDDEN_N; i++) {
-		n = strlen(hidden[i]);
+		n = (long)strlen(hidden[i]);
 		if (!strncmp(p, hidden[i], n) && (p[n] == '\0' || p[n] == '/'))
-			return true;
+			return 1;
 	}
-	return false;
+	return 0;
 }
 
-static bool name_blocked(const char *n, int len)
+static int name_blocked(const char *n, int len)
 {
 	unsigned int i;
+	long l;
 
-	if (len <= 0 || len > 64) return false;
+	if (len <= 0 || len > 64) return 0;
 	for (i = 0; i < BLK_N; i++)
 		if ((int)strlen(blk_name[i]) == len && !memcmp(n, blk_name[i], len))
-			return true;
+			return 1;
 	for (i = 0; i < BLK_PF; i++) {
-		size_t l = strlen(blk_pfx[i]);
-		if ((size_t)len > l && !memcmp(n, blk_pfx[i], l))
-			return true;
+		l = (long)strlen(blk_pfx[i]);
+		if ((long)len > l && !memcmp(n, blk_pfx[i], l))
+			return 1;
 	}
-	return false;
+	return 0;
 }
 
-static bool text_blocked(const char *s, size_t len)
+static int text_blocked(const char *s, long len)
 {
 	unsigned int i;
+	long n;
 
-	if (!len) return false;
+	if (!len) return 0;
 	for (i = 0; i < BLK_T; i++) {
-		size_t n = strlen(blk_text[i]);
+		n = (long)strlen(blk_text[i]);
 		if (n > len) continue;
-		if (kp_memmem(s, len, blk_text[i], n)) return true;
+		if (kp_memmem(s, len, blk_text[i], n)) return 1;
 	}
-	return false;
+	return 0;
 }
 
 static void blank_word(char *b, const char *w)
 {
-	size_t n = strlen(w);
+	long n = (long)strlen(w);
 	char *p = b;
 
 	while ((p = strstr(p, w))) { memset(p, ' ', n); p += n; }
@@ -280,7 +274,7 @@ static void set_bootstate(char *c)
 		return;
 	}
 	if (!strncmp(v, "red", 3)) {
-		size_t tail = strlen(v + 3);
+		long tail = (long)strlen(v + 3);
 		memmove(v + 5, v + 3, tail + 1);
 		memcpy(v, "green", 5);
 	}
@@ -311,7 +305,7 @@ static void set_verity(char *c)
 	if (!p) return;
 	p += 11;
 	if (!strncmp(p, "disabled", 8) || !strncmp(p, "logging", 7)) {
-		size_t tail = strlen(p + 8);
+		long tail = (long)strlen(p + 8);
 		memmove(p + 9, p + 8, tail + 1);
 		memcpy(p, "enforcing", 9);
 	}
@@ -364,7 +358,7 @@ static void scrub_ctx(char *c)
 }
 
 /* ---------- getname ---------- */
-struct gp_data { char path[PATH_S]; bool hide; };
+struct gp_data { char path[PATH_S]; int hide; };
 
 static struct kretprobe kr_name = {
 	.kp.symbol_name = "getname_flags",
@@ -378,7 +372,7 @@ static int name_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	const char __user *u = (const char __user *)P_ARG0(regs);
 	char c;
 
-	d->hide = false;
+	d->hide = 0;
 	if (bypass()) return 1;
 	if (!u) return 1;
 	if (get_user(c, u) || c != '/') return 1;
@@ -420,8 +414,9 @@ static DEFINE_PER_CPU(struct shadow, g_sh);
 static int filter_actor(struct dir_context *c, const char *name, int namlen,
 			loff_t off, u64 ino, unsigned type)
 {
-	struct shadow *s = container_of(c, struct shadow, dc);
+	struct shadow *s = this_cpu_ptr(&g_sh);
 
+	(void)c;
 	s->dc.pos = off;
 	if (name_blocked(name, namlen)) { s->orig->pos = off; return 0; }
 	return s->orig->actor(s->orig, name, namlen, off, ino, type);
@@ -488,10 +483,10 @@ static void post_read(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
 	long ret = (long)regs_return_value(regs);
 	int mode = this_cpu_read(g_pread);
 	char buf[1024];
-	size_t n;
+	long n;
 
 	if (!mode || ret <= 0) return;
-	n = ret > (long)sizeof(buf) - 1 ? sizeof(buf) - 1 : (size_t)ret;
+	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
 	if (copy_from_user(buf, ub, n)) return;
 	buf[n] = '\0';
 
@@ -535,10 +530,10 @@ static void post_rl(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
 	char __user *ub = (char __user *)P_ARG1(regs);
 	long ret = (long)regs_return_value(regs);
 	char buf[64];
-	size_t n;
+	long n;
 
 	if (!this_cpu_read(g_rl) || ret <= 0) return;
-	n = ret > (long)sizeof(buf) - 1 ? sizeof(buf) - 1 : (size_t)ret;
+	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
 	if (copy_from_user(buf, ub, n)) return;
 	buf[n] = '\0';
 	if (!strstr(buf, DEV_NAME)) return;
@@ -548,7 +543,7 @@ static void post_rl(struct kprobe *p, struct pt_regs *regs, unsigned long fl)
 #endif
 
 /* ---------- seq compaction ---------- */
-struct tr_data { struct seq_file *m; size_t saved; bool maps; };
+struct tr_data { struct seq_file *m; long saved; int maps; };
 
 static struct kretprobe kr_mounts, kr_mountinfo, kr_modules, kr_misc;
 static struct kretprobe kr_fs, kr_vm, kr_status;
@@ -563,22 +558,22 @@ static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	d->m = m;
 	d->saved = 0;
-	d->maps = false;
+	d->maps = 0;
 	if (bypass()) return 0;
 	if (!m || !m->buf || m->size < m->count || m->size > 0x100000) return 0;
-	d->saved = m->count;
+	d->saved = (long)m->count;
 	return 0;
 }
 
 static int tr_entry_maps(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	tr_entry(ri, regs);
-	((struct tr_data *)ri->data)->maps = true;
+	((struct tr_data *)ri->data)->maps = 1;
 	return 0;
 }
 
 #if WANT_TRACER
-static void zero_tracer(char *buf, size_t start, size_t end)
+static void zero_tracer(char *buf, long start, long end)
 {
 	char *p = kp_memmem(buf + start, end - start, "TracerPid:", 10);
 
@@ -592,16 +587,16 @@ static void zero_tracer(char *buf, size_t start, size_t end)
 #endif
 
 #if WANT_PERMS
-static void defang_perms(char *buf, size_t start, size_t end)
+static void defang_perms(char *buf, long start, long end)
 {
-	size_t i = start;
+	long i = start;
 
 	while (i < end) {
 		char *nl = memchr(buf + i, '\n', end - i);
-		size_t ll = nl ? (size_t)(nl - (buf + i)) + 1 : end - i;
+		long ll = nl ? (long)(nl - (buf + i)) + 1 : end - i;
 		char *sp = memchr(buf + i, ' ', ll);
 
-		if (sp && (size_t)(sp - buf) + 4 < i + ll &&
+		if (sp && (sp - buf) + 4 < i + ll &&
 		    sp[1] == 'r' && sp[2] == 'w' && sp[3] == 'x')
 			sp[2] = '-';
 		i += ll;
@@ -613,31 +608,31 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct tr_data *d = (struct tr_data *)ri->data;
 	struct seq_file *m = d->m;
-	size_t i, o, end;
+	long i, o, end;
 
-	if (!d->saved || !m || m->count <= d->saved) return 0;
+	if (!d->saved || !m || (long)m->count <= d->saved) return 0;
 
 #if WANT_TRACER
-	zero_tracer(m->buf, d->saved, m->count);
+	zero_tracer(m->buf, d->saved, (long)m->count);
 #endif
 #if WANT_PERMS
-	if (d->maps) defang_perms(m->buf, d->saved, m->count);
+	if (d->maps) defang_perms(m->buf, d->saved, (long)m->count);
 #endif
 
 	i = d->saved;
-	end = m->count;
+	end = (long)m->count;
 	o = d->saved;
 
 	while (i < end) {
 		char *nl = memchr(m->buf + i, '\n', end - i);
-		size_t ll = nl ? (size_t)(nl - (m->buf + i)) + 1 : end - i;
+		long ll = nl ? (long)(nl - (m->buf + i)) + 1 : end - i;
 
 		if (text_blocked(m->buf + i, ll)) { i += ll; continue; }
 		if (o != i) memmove(m->buf + o, m->buf + i, ll);
 		o += ll;
 		i += ll;
 	}
-	m->count = o;
+	m->count = (unsigned long)o;
 	return 0;
 }
 
@@ -650,7 +645,7 @@ static void hook_kp(struct kprobe *kp, const char *sym,
 	if (register_kprobe(kp)) memset(kp, 0, sizeof(*kp));
 }
 
-static void hook_tr(struct kretprobe *kr, const char *sym, bool maps)
+static void hook_tr(struct kretprobe *kr, const char *sym, int maps)
 {
 	kr->kp.symbol_name = sym;
 	kr->entry_handler = maps ? tr_entry_maps : tr_entry;
@@ -680,17 +675,17 @@ static void hooks_install(void)
 	hook_kp(&kp_rl, "vfs_readlink", pre_rl, post_rl);
 #endif
 
-	hook_tr(&kr_mounts, "show_vfsmnt", false);
-	hook_tr(&kr_mountinfo, "show_mountinfo", false);
-	hook_tr(&kr_modules, "m_show", false);
-	hook_tr(&kr_misc, "misc_show", false);
-	hook_tr(&kr_fs, "filesystems_proc_show", false);
-	hook_tr(&kr_vm, "s_show", false);
-	hook_tr(&kr_status, "proc_pid_status", false);
+	hook_tr(&kr_mounts, "show_vfsmnt", 0);
+	hook_tr(&kr_mountinfo, "show_mountinfo", 0);
+	hook_tr(&kr_modules, "m_show", 0);
+	hook_tr(&kr_misc, "misc_show", 0);
+	hook_tr(&kr_fs, "filesystems_proc_show", 0);
+	hook_tr(&kr_vm, "s_show", 0);
+	hook_tr(&kr_status, "proc_pid_status", 0);
 #if WANT_MAPS
-	hook_tr(&kr_maps, "show_map_vma", true);
-	hook_tr(&kr_smaps, "show_smap", true);
-	hook_tr(&kr_roll, "smaps_rollup_show", true);
+	hook_tr(&kr_maps, "show_map_vma", 1);
+	hook_tr(&kr_smaps, "show_smap", 1);
+	hook_tr(&kr_roll, "smaps_rollup_show", 1);
 #endif
 }
 
@@ -736,7 +731,7 @@ static void pick_fake_path(void)
 }
 
 /* ---------- ioctl ---------- */
-static struct task_struct *task_get(pid_t pid)
+static struct task_struct *task_get(int pid)
 {
 	struct task_struct *t;
 
@@ -747,13 +742,13 @@ static struct task_struct *task_get(pid_t pid)
 	return t;
 }
 
-static void wb_size(unsigned long arg, bool c32, __u64 sz)
+static void wb_size(unsigned long arg, int c32, unsigned long long sz)
 {
 #ifdef CONFIG_COMPAT
 	if (c32) {
 		struct copy_mem32 x;
 		if (copy_from_user(&x, (void __user *)arg, sizeof(x))) return;
-		x.size = (__u32)sz;
+		x.size = (unsigned int)sz;
 		copy_to_user((void __user *)arg, &x, sizeof(x));
 		return;
 	}
@@ -773,7 +768,7 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	void *kbuf;
 	char small[SMALL_IO];
 	int ret;
-	bool c32 = false;
+	int c32 = 0;
 
 #ifdef CONFIG_COMPAT
 	c32 = in_compat_syscall();
@@ -810,7 +805,7 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		struct mm_struct *mm;
 		struct vm_area_struct *vma;
 		char pname[256];
-		__u64 found = 0;
+		unsigned long long found = 0;
 
 		memset(&mb, 0, sizeof(mb));
 		if (c32) {
@@ -824,13 +819,13 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			return -EFAULT;
 		}
 		if (!mb.pid || !mb.name) return -EINVAL;
-		if (strncpy_from_user(pname, (const char __user *)(uintptr_t)mb.name,
+		if (strncpy_from_user(pname, (const char __user *)(unsigned long)mb.name,
 				      sizeof(pname) - 1) < 0)
 			return -EFAULT;
 		pname[sizeof(pname) - 1] = '\0';
 		if (!pname[0]) return -EINVAL;
 
-		tsk = task_get((pid_t)mb.pid);
+		tsk = task_get(mb.pid);
 		if (!tsk) return -ESRCH;
 		mm = get_task_mm(tsk);
 		put_task_struct(tsk);
@@ -848,9 +843,9 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (c32) {
 #ifdef CONFIG_COMPAT
 			struct mod_base32 y = {
-				.pid = (__s32)mb.pid,
-				.name = (__u32)mb.name,
-				.base = (__u32)found,
+				.pid = mb.pid,
+				.name = (unsigned int)mb.name,
+				.base = (unsigned int)found,
 			};
 			copy_to_user((void __user *)arg, &y, sizeof(y));
 #endif
@@ -863,22 +858,25 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	if (!cm.pid || !cm.size || cm.size > MAX_IO || !cm.addr || !cm.buffer)
 		return -EINVAL;
 
-	tsk = task_get((pid_t)cm.pid);
+	tsk = task_get(cm.pid);
 	if (!tsk) return -ESRCH;
 
-	kbuf = cm.size <= SMALL_IO ? (void *)small : kvmalloc(cm.size, GFP_KERNEL);
+	kbuf = cm.size <= SMALL_IO ? (void *)small : kvmalloc((unsigned long)cm.size, GFP_KERNEL);
 	if (!kbuf) { put_task_struct(tsk); return -ENOMEM; }
 
 	if (cmd == OP_READ) {
-		ret = access_process_vm(tsk, cm.addr, kbuf, (int)cm.size, 0);
-		if (ret > 0 && copy_to_user((void __user *)(uintptr_t)cm.buffer, kbuf, ret))
+		ret = access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
+					(int)cm.size, 0);
+		if (ret > 0 &&
+		    copy_to_user((void __user *)(unsigned long)cm.buffer, kbuf, ret))
 			ret = -EFAULT;
 	} else if (cmd == OP_WRITE) {
-		if (copy_from_user(kbuf, (void __user *)(uintptr_t)cm.buffer, cm.size)) {
+		if (copy_from_user(kbuf, (void __user *)(unsigned long)cm.buffer,
+				   (unsigned long)cm.size)) {
 			ret = -EFAULT;
 		} else {
-			ret = access_process_vm(tsk, cm.addr, kbuf, (int)cm.size,
-						FOLL_WRITE | FOLL_FORCE);
+			ret = access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
+						(int)cm.size, FOLL_WRITE | FOLL_FORCE);
 		}
 	} else {
 		ret = -EINVAL;
@@ -887,7 +885,7 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	if (kbuf != (void *)small) kvfree(kbuf);
 	put_task_struct(tsk);
 
-	if (ret > 0) { wb_size(arg, c32, ret); return 0; }
+	if (ret > 0) { wb_size(arg, c32, (unsigned long long)ret); return 0; }
 	return ret < 0 ? ret : -EIO;
 }
 
@@ -915,6 +913,10 @@ static long alihidden_start(const char *args, const char *event, void *__user re
 {
 	int r;
 
+	(void)args;
+	(void)event;
+	(void)reserved;
+
 	pick_fake_path();
 	r = misc_register(&dev);
 	if (r) return r;
@@ -924,18 +926,20 @@ static long alihidden_start(const char *args, const char *event, void *__user re
 	saved_kptr = kptr_restrict;
 	kptr_restrict = 2;
 	hooks_install();
-	inited = true;
+	inited = 1;
 	return 0;
 }
 
 static long alihidden_stop(void *__user reserved)
 {
+	(void)reserved;
+
 	if (!inited) return 0;
 	hooks_remove();
 	kptr_restrict = saved_kptr;
 	uts_restore();
 	misc_deregister(&dev);
-	inited = false;
+	inited = 0;
 	return 0;
 }
 
