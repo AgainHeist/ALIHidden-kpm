@@ -1,7 +1,32 @@
+ifndef TARGET_COMPILE
+    $(error TARGET_COMPILE not set)
+endif
 
-KPM_NAME    := ALiHidden
-KPM_VERSION := 10.0.0
-KPM_SRC     := alihidden.c
-KPM_CFLAGS  := -DKPM -O2 -fno-strict-aliasing
+ifndef KP_DIR
+    KP_DIR = ../kp
+endif
 
-include $(KP_DIR)/kpatch.mk
+CC = $(TARGET_COMPILE)gcc
+LD = $(TARGET_COMPILE)ld
+
+CFLAGS += -nostdinc
+CFLAGS += -fno-pic -fno-PIC -fno-pie -fno-stack-protector
+CFLAGS += -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-exceptions
+
+INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
+INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
+
+objs := alihidden.o
+
+all: alihidden.kpm
+
+alihidden.kpm: ${objs}
+	${CC} -r -o $@ $^
+
+%.o: %.c
+	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -Talihidden.lds -c -O2 -o $@ $<
+
+.PHONY: clean
+clean:
+	rm -f *.kpm
+	find . -name "*.o" | xargs rm -f
