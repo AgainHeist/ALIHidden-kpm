@@ -87,17 +87,13 @@ extern long strncpy_from_user(char *dest, const char __user *src, long count);
 /* ============================================================
  *  MISSING-TYPE SHIM
  *  KernelPatch fake headers do not provide any of this, so we
- *  declare it here. Nothing below is a duplicate definition.
+ *  declare it here. struct list_head comes from ktypes.h.
  * ============================================================ */
 
 struct module;
 struct inode;
 struct vfsmount;
 struct pid;
-
-struct list_head {
-	struct list_head *next, *prev;
-};
 
 struct qstr {
 	unsigned int hash;
@@ -197,8 +193,8 @@ struct kp_utsns {
 };
 extern struct kp_utsns init_uts_ns;
 
-/* ---------- external kernel symbols ---------- */
-extern unsigned long kallsyms_lookup_name(const char *name);
+/* ---------- external kernel symbols ----------
+ * kallsyms_lookup_name comes from kallsyms.h (function pointer). */
 extern int misc_register(struct miscdevice *misc);
 extern void misc_deregister(struct miscdevice *misc);
 extern int kern_path(const char *name, unsigned int flags, struct path *path);
@@ -370,6 +366,7 @@ static int register_kprobe(struct kprobe *p)
 	unsigned long addr;
 
 	if (!p->symbol_name) return -EINVAL;
+	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(p->symbol_name);
 	if (!addr) return -ESRCH;
 	p->addr = (void *)addr;
@@ -394,6 +391,7 @@ static int register_kretprobe(struct kretprobe *kr)
 
 	if (!kr->kp.symbol_name) return -EINVAL;
 	if (kr->data_size > KRET_DATA_MAX) return -E2BIG;
+	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(kr->kp.symbol_name);
 	if (!addr) return -ESRCH;
 	kr->kp.addr = (void *)addr;
