@@ -1,4 +1,12 @@
-kpm:
+name: build-kpm
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  kpm:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -12,19 +20,9 @@ kpm:
         run: |
           git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
           ls kp/kernel/include/kpmodule.h
-          ls kp/kernel/patch/include/kputils.h
-          ls kp/kernel/linux/include/linux/module.h
 
-      - name: preflight
+      - name: build
         run: |
-          for f in kpm/alihidden.c kpm/alihidden.lds kpm/Makefile; do
-            [ -f "$f" ] || { echo "::error::missing $f"; exit 1; }
-          done
-          grep -q 'kpatch.mk' kpm/Makefile && echo "WARN: Makefile me kpatch.mk bacha hua hai"
-
-      - name: build KPM
-        run: |
-          set -x
           make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu-
           ls -la kpm
 
