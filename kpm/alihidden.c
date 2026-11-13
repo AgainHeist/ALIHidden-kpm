@@ -1,12 +1,13 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v12  LOAD-SAFE
-//  v12 fixes:
-//   - BTI: build me -mbranch-protection=standard MUST
-//   - fops offset math galat tha (>=4.16 me poll slot hit ho raha tha)
-//   - CONFIG_COMPAT KPM build me define nahi hota -> compat
-//     detection runtime (in_compat_syscall kallsyms se)
-//   - uts / cmdline layout sanity gate (randstruct se bachav)
-//   - cmd_end dangling pointer fix
+//  DARKxKERNEL KPM  (nvsvc)  v13  LOAD-SAFE
+//  v13 fixes (v12 ke upar):
+//   - uts: "kpatch" token preserve (APatch jailbreak-mode fix),
+//     release sirf APatch/KSU/Magisk marker par cut
+//   - fops: fill-all hata, sirf llseek/read/write/poll/ioctl,
+//     mmap_supported_flags ab NULL (pehle function ptr tha)
+//   - seq scrub: fresh seq_file (count==0) skip ho raha tha
+//   - compat: in_compat_syscall fallback + OP_ABI force
+//   - OP_UTS runtime toggle
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -57,7 +58,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("11.1.0");
+KPM_VERSION("12.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -237,7 +238,7 @@ static void (*k_kvfree)(void *);
 static int  (*k_access_process_vm)(struct task_struct *, unsigned long, void *, int, int);
 static loff_t (*k_no_llseek)(struct kp_file *, loff_t, int);
 static int  (*k_copy_from_user)(void *, const void __user *, unsigned long);
-static int  (*k_in_compat)(void);          /* FIX v12 */
+static int  (*k_in_compat)(void);
 static int  *k_kptr_restrict;
 static char **k_saved_cmdline;
 static struct kp_utsns *k_uts;
@@ -264,7 +265,7 @@ static int user_ok(unsigned long a)
  * ============================================================ */
 #define FOPS_MAX 384
 static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
-static unsigned int uio_off, cio_off;
+static unsigned int uio_off, cio_off, poll_off;
 
 static void fops_put(unsigned int off, const void *fn)
 {
@@ -272,18 +273,17 @@ static void fops_put(unsigned int off, const void *fn)
 		*(const void **)(fops_buf + off) = fn;
 }
 
-/* FIX v12: sahi offsets.
- * < 4.7  : unlocked_ioctl = idx 8, compat_ioctl = idx 9
- * >= 4.7 : (aio_read/write -> read_iter/write_iter, iterate_shared,
- *           phir iopoll) unlocked_ioctl = idx 10, compat_ioctl = idx 11
- * v11 ka >=7 -> idx 9 galat tha: wo poll slot hai. */
+/* < 4.7  : poll = 7, unlocked_ioctl = 8, compat_ioctl = 9
+ * >= 4.7 : poll = 9, unlocked_ioctl = 10, compat_ioctl = 11
+ * llseek / read / write dono layouts me 1 / 2 / 3. */
 static void fops_layout(unsigned int maj, unsigned int min)
 {
 	unsigned long v = (unsigned long)maj * 100 + min;
-	unsigned int idx = (v >= 407) ? 10 : 8;
+	unsigned int p = (unsigned int)sizeof(void *);
 
-	uio_off = idx * (unsigned int)sizeof(void *);
-	cio_off = uio_off + (unsigned int)sizeof(void *);
+	if (v >= 407) { poll_off = 9 * p;  uio_off = 10 * p; }
+	else          { poll_off = 7 * p;  uio_off = 8 * p; }
+	cio_off = uio_off + p;
 }
 
 /* ============================================================
@@ -465,7 +465,9 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_HIDE    0x804
 #define OP_STRICT  0x805
 #define OP_VER     0x806
-#define API_VER    4
+#define OP_ABI     0x807
+#define OP_UTS     0x808
+#define API_VER    5
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -489,6 +491,7 @@ static int  inited;
 static int  uts_ok;
 static int  strict = 1;
 static int  hide_pid;
+static int  abi_force = -1;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
 static unsigned long iterate_addr, piddir_addr;
@@ -607,6 +610,12 @@ static const char *const uts_mark[] = {
 	"APatch", "KernelSU", "kpatch", "KPM", "Magisk", "SukiSU", "ReSukiSU",
 };
 
+/* kpatch ko chhod ke -- APatch isi token se patched kernel detect karta hai,
+ * isliye release cut-list me "kpatch" nahi hai */
+static const char *const uts_cut[] = {
+	"APatch", "KernelSU", "KPM", "Magisk", "SukiSU", "ReSukiSU",
+};
+
 static int uts_marked(const char *s)
 {
 	unsigned int i;
@@ -615,9 +624,14 @@ static int uts_marked(const char *s)
 	return 0;
 }
 
-/* FIX v12: randstruct / layout mismatch gate.
- * Sirf "Linux" check kaafi nahi tha -- release me digit+dot aur
- * version me printable hona chahiye, warna scrub hi skip. */
+static int uts_cut_marked(const char *s)
+{
+	unsigned int i;
+	for (i = 0; i < ARRAY_SIZE(uts_cut); i++)
+		if (strstr(s, uts_cut[i])) return 1;
+	return 0;
+}
+
 static int uts_layout_ok(void)
 {
 	const char *r, *v;
@@ -643,6 +657,7 @@ static void uts_scrub(void)
 {
 	char *r, *v, *c;
 
+	if (uts_ok) return;
 	if (!uts_layout_ok()) {
 		pr_info("nvsvc: uts layout mismatch, skip\n");
 		return;
@@ -653,13 +668,13 @@ static void uts_scrub(void)
 	memcpy(saved_version, v, sizeof(saved_version));
 	uts_ok = 1;
 
-	if (uts_marked(r)) {
+	if (uts_cut_marked(r)) {
 		c = strpbrk(r, "-+");
 		if (c) *c = '\0';
 	}
+
 	blank_word(v, "APatch");
 	blank_word(v, "KernelSU");
-	blank_word(v, "kpatch");
 	blank_word(v, "KPM");
 	blank_word(v, "Magisk");
 	c = v + strlen(v);
@@ -671,6 +686,7 @@ static void uts_restore(void)
 	if (!uts_ok || !kptr_ok(k_uts)) return;
 	memcpy(k_uts->name.release, saved_release, sizeof(saved_release));
 	memcpy(k_uts->name.version, saved_version, sizeof(saved_version));
+	uts_ok = 0;
 }
 
 /* ---------- bootloader / props ---------- */
@@ -745,7 +761,6 @@ static void scrub_boot_args(char *c)
 	set_bootstate(c); set_locked(c); set_vbmeta(c); set_verity(c); set_selinux(c);
 }
 
-/* FIX v12: cmdline layout gate + cmd_end reset */
 static void cmdline_scrub(void)
 {
 	char *c;
@@ -968,7 +983,7 @@ static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 /* ---------- seq compaction ---------- */
-struct tr_data { struct kp_seq_file *m; long saved; int maps; };
+struct tr_data { struct kp_seq_file *m; long saved; int maps; int ok; };
 static struct kretprobe kr_mounts, kr_mountinfo, kr_modules, kr_misc;
 static struct kretprobe kr_fs, kr_vm, kr_status, kr_smaps, kr_maps, kr_roll;
 
@@ -976,11 +991,12 @@ static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct tr_data *d = (struct tr_data *)ri->data;
 	struct kp_seq_file *m = (struct kp_seq_file *)P_ARG0(regs);
-	d->m = m; d->saved = 0; d->maps = 0;
+	d->m = m; d->saved = 0; d->maps = 0; d->ok = 0;
 	if (bypass() || !kptr_ok(m) || !kptr_ok(m->buf)) return 0;
 	if (m->size < 64 || m->size > 0x100000) return 0;
 	if (m->count > m->size) return 0;
 	d->saved = (long)m->count;
+	d->ok = 1;
 	return 1;
 }
 
@@ -1021,7 +1037,7 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct kp_seq_file *m = d->m;
 	long i, o, end;
 	(void)regs;
-	if (!d->saved || !kptr_ok(m) || (long)m->count <= d->saved) return 0;
+	if (!d->ok || !kptr_ok(m) || (long)m->count <= d->saved) return 0;
 	if ((unsigned long)m->count > m->size) return 0;
 	zero_tracer(m->buf, d->saved, (long)m->count);
 	if (d->maps) defang_perms(m->buf, d->saved, (long)m->count);
@@ -1172,7 +1188,9 @@ static int resolve_syms(void)
 	RS("kptr_restrict", k_kptr_restrict);
 	RS("saved_command_line", k_saved_cmdline);
 	RS("init_uts_ns", k_uts);
-	RS("in_compat_syscall", k_in_compat);        /* FIX v12 */
+	RS("in_compat_syscall", k_in_compat);
+	if (!k_in_compat) RS("is_compat_task", k_in_compat);
+	if (!k_in_compat) RS("__in_compat_syscall", k_in_compat);
 	RS("misc_register", k_misc_register);
 	RS("misc_deregister", k_misc_deregister);
 	RS("kern_path", k_kern_path);
@@ -1229,7 +1247,7 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	int ret, c32 = 0;
 	(void)f;
 
-	if (k_in_compat) c32 = k_in_compat() ? 1 : 0;
+	c32 = abi_force >= 0 ? abi_force : (k_in_compat ? (k_in_compat() ? 1 : 0) : 0);
 	memset(&cm, 0, sizeof(cm));
 
 	if (cmd == OP_INIT) return 0;
@@ -1250,6 +1268,19 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
 		hide_pid = v;
+		return 0;
+	}
+	if (cmd == OP_ABI) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		abi_force = v;
+		return 0;
+	}
+	if (cmd == OP_UTS) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		if (!k_uts) return 0;
+		if (v) uts_scrub(); else uts_restore();
 		return 0;
 	}
 
@@ -1338,6 +1369,18 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	return ret < 0 ? ret : -EIO;
 }
 
+static loff_t dev_noop_llseek(struct kp_file *f, loff_t o, int w)
+{ (void)f; (void)w; return o; }
+
+static ssize_t dev_read(struct kp_file *f, char __user *b, size_t n, loff_t *p)
+{ (void)f; (void)b; (void)n; (void)p; return 0; }
+
+static ssize_t dev_write(struct kp_file *f, const char __user *b, size_t n, loff_t *p)
+{ (void)f; (void)b; (void)n; (void)p; return 0; }
+
+static unsigned int dev_poll(struct kp_file *f, void *t)
+{ (void)f; (void)t; return 1u; }
+
 static struct kp_miscdevice dev;
 
 static long owner_ctl(const char *ctl_args, char __user *out_msg, int outlen)
@@ -1355,7 +1398,6 @@ KPM_CTL0(owner_ctl);
 static long nvsvc_start(const char *args, const char *event, void *__user reserved)
 {
 	unsigned int maj = 0, min = 0;
-	unsigned int off;
 	int r;
 	(void)args; (void)event; (void)reserved;
 
@@ -1379,17 +1421,14 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	fops_layout(maj, min);
 
 	memset(fops_buf, 0, sizeof(fops_buf));
-	/* fill-all: unknown slot par bhi dev_ioctl -- offset galat ho to bhi
-	 * kuch nahi tootega, kyunki dev_ioctl garbage arg par 0 deta hai.
-	 * slot 0 (owner) NULL rehta hai, warna try_module_get crash. */
-	for (off = sizeof(void *); off + sizeof(void *) <= FOPS_MAX; off += sizeof(void *))
-		fops_put(off, (const void *)dev_ioctl);
-	/* FIX v12: exact ioctl slots + llseek */
+	fops_put(1 * sizeof(void *),
+		 (const void *)(k_no_llseek ? k_no_llseek : dev_noop_llseek));
+	fops_put(2 * sizeof(void *), (const void *)dev_read);
+	fops_put(3 * sizeof(void *), (const void *)dev_write);
+	fops_put(poll_off, (const void *)dev_poll);
 	fops_put(uio_off, (const void *)dev_ioctl);
 	fops_put(cio_off, (const void *)dev_ioctl);
-	fops_put((unsigned int)sizeof(void *),
-		 (const void *)(k_no_llseek ? k_no_llseek : dev_ioctl));
-	pr_info("nvsvc: kernel %u.%u ioctl_off=%u\n", maj, min, uio_off);
+	pr_info("nvsvc: kernel %u.%u uio=%u poll=%u\n", maj, min, uio_off, poll_off);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
