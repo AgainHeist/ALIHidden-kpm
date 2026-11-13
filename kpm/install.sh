@@ -12,5 +12,6 @@ else
   echo "wanbai: NODE MISSING -> dmesg"
 fi
 echo "kpatch token: $(grep -c kpatch /proc/version) (1 = APatch Full mode)"
+echo "btf: $(dmesg | grep -c 'wanbai: btf ok')"
 echo "mgr uid: $(dmesg | grep -o 'wanbai: mgr uid [0-9]*' | tail -1)"
 echo "game uid: $(dmesg | grep -o 'wanbai: game uid [0-9]*' | tail -1)"
