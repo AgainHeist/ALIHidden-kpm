@@ -1,13 +1,11 @@
 // ============================================================
-//  DARKxKERNEL KPM  (wanbai)  v20
-//  v20:
-//   - node ka naam "wanbai" (client ki hardcoded list me hai)
-//   - /dev readdir me root ke liye entry khud emit hoti hai,
-//     order pe depend nahi -> galat device pakadna khatam
-//   - game ko node dikhta nahi
-//   - /data/local/tmp rewrite se hataya, sirf listing me hide
-//   - dir filter ctx->pos dono taraf sync
-//   - fops_layout clamp, dev.mode 0600
+//  DARKxKERNEL KPM  (wanbai)  v21
+//  v21:
+//   - /data/adb aur manager data dirs ab REWRITE nahi hote,
+//     sirf listing me hide -> APatch package_config/settings safe
+//   - mgr uid detection multi-path + fail par loud warning
+//   - OP_STATE debug ioctl
+//   - baaki v20 jaisa (wanbai node, /dev announce, crash fixes)
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -58,7 +56,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("20.0.0");
+KPM_VERSION("21.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -485,7 +483,8 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_FLUSH   0x80D
 #define OP_VFS     0x80E
 #define OP_PING    0x80F
-#define API_VER    12
+#define OP_STATE   0x810
+#define API_VER    13
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -534,31 +533,27 @@ static int bypass(void)
 	return mgr_uid > 0 && (int)u == mgr_uid;
 }
 
-/* Sirf wahi paths jo "gayab" dikhne chahiye (open fail ho jaye).
- * /data/local/tmp jaan bujh ke nahi: listing me hide, open chalta rahe. */
+/* ============================================================
+ *  REWRITE LIST  (open sach me fail hona chahiye)
+ *  Yahan sirf wahi cheezein hain jo root binaries/config hain.
+ *  /data/adb, manager data dirs, /data/local/tmp => sirf listing
+ *  me hide (blk_name), open chalta rahe. Isse APatch ka
+ *  package_config / settings kabhi tootta nahi.
+ * ============================================================ */
 static const char *const hidden[] = {
-	"/data/adb", "/sbin/su", "/system/bin/su", "/system/xbin/su",
+	"/sbin/su", "/system/bin/su", "/system/xbin/su",
 	"/vendor/bin/su", "/vendor/bin/kp", "/system/xbin/kp",
-	"/system/bin/.ext", "/debug_ramdisk", "/sbin/.magisk",
-	"/system/bin/magisk", "/system/bin/ksud", "/system/bin/apd",
-	"/system/bin/kp", "/system/etc/init/magisk",
+	"/system/bin/kp", "/system/bin/magisk", "/system/bin/ksud",
+	"/system/bin/apd", "/system/bin/.ext", "/sbin/.magisk",
+	"/debug_ramdisk", "/system/app/Magisk", "/cache/magisk.log",
+	"/data/magisk", "/system/etc/init/magisk",
 	"/system/etc/init/init.magisk.rc", "/system/etc/init/init.kpatch.rc",
-	"/system/app/Magisk", "/cache/magisk.log", "/data/magisk",
-	"/data/data/com.topjohnwu.magisk",
-	"/data/user/0/com.topjohnwu.magisk",
-	"/data/user_de/0/com.topjohnwu.magisk",
-	"/data/data/me.weishu.kernelsu",
-	"/data/user/0/me.weishu.kernelsu",
-	"/data/user_de/0/me.weishu.kernelsu",
-	"/data/data/me.bmax.apatch",
-	"/data/user/0/me.bmax.apatch",
-	"/data/user_de/0/me.bmax.apatch",
-	"/proc/config.gz", "/sys/module/wanbai",
-	"/sys/class/misc/wanbai", "/sys/module/kpatch",
-	"/sys/module/kernelpatch", "/data/misc/.__np",
+	"/proc/config.gz", "/sys/module/wanbai", "/sys/class/misc/wanbai",
+	"/sys/module/kpatch", "/sys/module/kernelpatch",
 };
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
+/* listing se hide hone wale naam (sab jagah) */
 static const char *const blk_name[] = {
 	"su", "magisk", "Magisk", "magiskd", "ksud", "apd", "adb", "kpatch",
 	"kpatchd", "kp", "wanbai", ".__np", ".magisk", ".ext", "debug_ramdisk",
@@ -752,9 +747,15 @@ static void uts_restore(void)
 /* ---------- uid detect ---------- */
 static const char *const mgr_path[] = {
 	"/data/data/me.bmax.apatch",
-	"/data/data/me.weishu.kernelsu",
+	"/data/user/0/me.bmax.apatch",
+	"/data/user_de/0/me.bmax.apatch",
+	"/data/data/me.bmax.apatch.debug",
 	"/data/data/com.topjohnwu.magisk",
+	"/data/user/0/com.topjohnwu.magisk",
+	"/data/data/me.weishu.kernelsu",
+	"/data/user/0/me.weishu.kernelsu",
 	"/data/data/com.dergoogler.mmrl",
+	"/data/user/0/com.dergoogler.mmrl",
 	"/data/adb/ap",
 	"/data/adb/ksu",
 };
@@ -791,6 +792,7 @@ static void detect_uids(void)
 		if (u) game_uid = (int)u;
 	}
 	if (mgr_uid > 0) pr_info("wanbai: mgr uid %d\n", mgr_uid);
+	else pr_info("wanbai: WARN mgr uid DETECT FAIL (settings break ho sakti hain)\n");
 	if (game_uid > 0) pr_info("wanbai: game uid %d\n", game_uid);
 }
 
@@ -971,7 +973,6 @@ struct shadow {
 	int emitted;
 };
 
-/* /dev hai kya? iterate_dir arg0 = struct file* */
 static int is_dev_dir(unsigned long filep)
 {
 	struct kp_file *f = (struct kp_file *)filep;
@@ -995,8 +996,6 @@ static bool filter_actor(struct kp_dir_context *c, const char *name, int namlen,
 
 	c->pos = off;
 
-	/* /dev + root: apni entry pehle khud emit karo, order pe bharosa nahi.
-	 * Real entry skip ho jati hai taaki duplicate na bane. */
 	if (s->devdir) {
 		if (!s->emitted) {
 			s->emitted = 1;
@@ -1341,8 +1340,10 @@ static void hooks_install(void)
 	if (iterate_addr &&
 	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0))
 		hooks_ok++;
-	else
+	else {
 		iterate_addr = 0;
+		pr_info("wanbai: WARN iterate_dir hook fail\n");
+	}
 
 	piddir_addr = kallsyms_lookup_name ? kallsyms_lookup_name("proc_pid_readdir") : 0;
 	if (piddir_addr &&
@@ -1490,6 +1491,14 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	if (cmd == OP_PING) {
 		int v = (int)(((unsigned)MAGIC << 16) | ((hooks_ok & 0xFF) << 8) | 0x01);
 		return copy_to_user((void __user *)arg, &v, sizeof(v)) ? -EFAULT : 0;
+	}
+	if (cmd == OP_STATE) {
+		int v[4];
+		v[0] = mgr_uid;
+		v[1] = game_uid;
+		v[2] = (int)hooks_ok;
+		v[3] = (strict << 8) | (game_byp << 4) | (vfs_on ? 2 : 0) | (dev_ok ? 1 : 0);
+		return copy_to_user((void __user *)arg, v, sizeof(v)) ? -EFAULT : 0;
 	}
 	if (cmd == OP_STRICT) {
 		int v;
@@ -1713,7 +1722,6 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	dev.fops = (const struct kp_fops *)fops_buf;
 	dev.mode = 0600;
 
-	/* hooks se pehle, warna lookup khud redirect ho jayega */
 	pick_fake_path();
 	detect_uids();
 
