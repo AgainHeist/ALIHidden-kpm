@@ -1,7 +1,7 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v4
+//  DARKxKERNEL KPM  (nvsvc)  v5
 //  Owner tag: XOR-encoded + checksum-locked
-//  Kernel 5.4 - 6.1 (arm64 / x86_64)
+//  Kernel 5.4 - 6.12+ (arm64 / x86_64)  |  version-guarded
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -61,7 +61,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("4.0.0");
+KPM_VERSION("5.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -130,7 +130,7 @@ KPM_DESCRIPTION("system service");
 #endif
 
 /* ============================================================
- *  KERNEL STRUCT SHIMS (5.4 - 6.1)
+ *  KERNEL STRUCT SHIMS (5.4 - 6.12)
  * ============================================================ */
 struct module;
 struct inode;
@@ -139,6 +139,7 @@ struct pid;
 struct task_struct;
 struct anon_vma;
 struct vm_operations_struct;
+struct mm_struct;
 
 struct qstr { unsigned int hash; unsigned int len; const unsigned char *name; };
 struct hlist_bl_node { struct hlist_bl_node *next, **pprev; };
@@ -164,25 +165,10 @@ struct dir_context {
 	loff_t pos;
 };
 
-struct file_operations {
-	struct module *owner;
-	loff_t (*llseek)(struct file *, loff_t, int);
-	ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
-	ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
-	ssize_t (*read_iter)(void *, void *);
-	ssize_t (*write_iter)(void *, void *);
-	int (*iopoll)(void *, void *);
-	int (*iterate)(struct file *, struct dir_context *);
-	int (*iterate_shared)(struct file *, struct dir_context *);
-	unsigned int (*poll)(struct file *, void *);
-	long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
-	long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
-};
-
 struct miscdevice {
 	int minor;
 	const char *name;
-	const struct file_operations *fops;
+	const void *fops;
 	struct list_head list;
 	void *parent;
 	void *this_device;
@@ -254,11 +240,55 @@ static struct kp_utsns *k_uts;
 #define strncpy_from_user(d, s, n)  (compat_strncpy_from_user((d), (s), (n)))
 #define kp_get_user_byte(dst, src)  copy_from_user((dst), (src), 1)
 
-/* kernel pointer sanity */
 static int kptr_ok(const void *p)
 {
 	unsigned long a = (unsigned long)p;
 	return a >= 0xffff000000000000UL && a != ~0UL;
+}
+
+/* ============================================================
+ *  file_operations  ->  offset self-calibration
+ *  (struct layout version ke hisaab se badalta hai, isliye
+ *   hardcoded cast nahi: ek zeroed byte buffer + computed off)
+ * ============================================================ */
+#define FOPS_MAX 384
+static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
+static unsigned int uio_off, cio_off;
+
+static void fops_put(unsigned int off, void *fn)
+{
+	if (off && off + sizeof(void *) <= FOPS_MAX)
+		*(void **)(fops_buf + off) = fn;
+}
+
+/* base layout: owner(0) llseek(1) read(2) write(3) read_iter(4)
+ * write_iter(5) iopoll(6) [iterate(7)] iterate_shared poll
+ * unlocked_ioctl compat_ioctl ...  ->  'iterate' 6.6 me hata hai */
+static void fops_table(unsigned int maj, unsigned int min)
+{
+	unsigned int idx = 10;
+	if (maj > 6 || (maj == 6 && min >= 6))
+		idx = 9;
+	uio_off = idx * sizeof(void *);
+	cio_off = uio_off + sizeof(void *);
+}
+
+/* def_chr_fops me sirf .open set hota hai -> usse offset verify */
+static void fops_probe(void)
+{
+	const unsigned long *p = (const unsigned long *)kallsyms_lookup_name("def_chr_fops");
+	unsigned int i, off;
+
+	if (!p) return;
+	for (i = 4; i < 20; i++) {
+		if (!kptr_ok((const void *)p[i])) continue;
+		off = (i - 4) * sizeof(void *);
+		if (off != 72 && off != 80) return;
+		uio_off = off;
+		cio_off = off + sizeof(void *);
+		pr_info("nvsvc: fops probe uio=%u\n", off);
+		return;
+	}
 }
 
 /* ============================================================
@@ -460,6 +490,7 @@ static int  hide_pid;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
 static unsigned long iterate_addr, piddir_addr;
+static char *cmd_end;
 
 static int bypass(void) { return current_uid() == 0 && !strict; }
 
@@ -553,7 +584,35 @@ static void blank_word(char *b, const char *w)
 	while ((p = strstr(p, w))) { memset(p, ' ', n); p += n; }
 }
 
+/* ---------- version ---------- */
+static int kver_mm(unsigned int *maj, unsigned int *min)
+{
+	const char *p;
+	unsigned int a = 0, b = 0;
+	if (!kptr_ok(k_uts)) return -1;
+	p = k_uts->name.release;
+	while (*p >= '0' && *p <= '9') a = a * 10 + (unsigned int)(*p++ - '0');
+	if (*p != '.') return -1;
+	p++;
+	while (*p >= '0' && *p <= '9') b = b * 10 + (unsigned int)(*p++ - '0');
+	if (!a) return -1;
+	*maj = a; *min = b;
+	return 0;
+}
+
 /* ---------- uts ---------- */
+static const char *const uts_mark[] = {
+	"APatch", "KernelSU", "kpatch", "KPM", "Magisk", "SukiSU", "ReSukiSU",
+};
+
+static int uts_marked(const char *s)
+{
+	unsigned int i;
+	for (i = 0; i < ARRAY_SIZE(uts_mark); i++)
+		if (strstr(s, uts_mark[i])) return 1;
+	return 0;
+}
+
 static void uts_scrub(void)
 {
 	char *r, *v, *c;
@@ -569,8 +628,10 @@ static void uts_scrub(void)
 	memcpy(saved_version, v, sizeof(saved_version));
 	uts_ok = 1;
 
-	c = strpbrk(r, "-+");
-	if (c) *c = '\0';
+	if (uts_marked(r)) {
+		c = strpbrk(r, "-+");
+		if (c) *c = '\0';
+	}
 	blank_word(v, "APatch");
 	blank_word(v, "KernelSU");
 	blank_word(v, "kpatch");
@@ -588,14 +649,24 @@ static void uts_restore(void)
 }
 
 /* ---------- bootloader / props ---------- */
+static int room(char *p, long n)
+{
+	return cmd_end && p + n <= cmd_end;
+}
+
 static void set_bootstate(char *c)
 {
 	char *p = strstr(c, "verifiedbootstate="), *v;
+	long tail;
 	if (!p) return;
 	v = p + 18;
-	if (!strncmp(v, "orange", 6) || !strncmp(v, "yellow", 6)) { memcpy(v, "green ", 6); return; }
+	if (!strncmp(v, "orange", 6) || !strncmp(v, "yellow", 6)) {
+		if (room(v, 6)) memcpy(v, "green ", 6);
+		return;
+	}
 	if (!strncmp(v, "red", 3)) {
-		long tail = (long)strlen(v + 3);
+		tail = (long)strlen(v + 3);
+		if (!room(v, tail + 6)) return;
 		memmove(v + 5, v + 3, tail + 1);
 		memcpy(v, "green", 5);
 	}
@@ -619,22 +690,29 @@ static void set_vbmeta(char *c)
 
 static void set_verity(char *c)
 {
-	char *p = strstr(c, "veritymode=");
+	char *p = strstr(c, "veritymode="), *v;
+	long tail;
 	if (!p) return;
-	p += 11;
-	if (!strncmp(p, "disabled", 8) || !strncmp(p, "logging", 7)) {
-		long tail = (long)strlen(p + 8);
-		memmove(p + 9, p + 8, tail + 1);
-		memcpy(p, "enforcing", 9);
+	v = p + 11;
+	if (!strncmp(v, "disabled", 8) || !strncmp(v, "logging", 7)) {
+		tail = (long)strlen(v + 8);
+		if (!room(v, tail + 10)) return;
+		memmove(v + 9, v + 8, tail + 1);
+		memcpy(v, "enforcing", 9);
 	}
 }
 
 static void set_selinux(char *c)
 {
-	char *p = strstr(c, "androidboot.selinux=");
-	if (!p || strncmp(p + 21, "permissive", 10)) return;
-	memcpy(p + 21, "enforcing", 9);
-	memmove(p + 30, p + 31, strlen(p + 31) + 1);
+	char *p = strstr(c, "androidboot.selinux="), *v;
+	long tail;
+	if (!p) return;
+	v = p + 21;
+	if (strncmp(v, "permissive", 10)) return;
+	tail = (long)strlen(v + 10);
+	if (!room(v, tail + 11)) return;
+	memcpy(v, "enforcing", 9);
+	memmove(v + 9, v + 10, tail + 1);
 }
 
 static void scrub_boot_args(char *c)
@@ -647,7 +725,9 @@ static void cmdline_scrub(void)
 	char *c;
 	if (!k_saved_cmdline || !kptr_ok(k_saved_cmdline)) return;
 	c = *k_saved_cmdline;
-	if (c && kptr_ok(c)) scrub_boot_args(c);
+	if (!c || !kptr_ok(c)) return;
+	cmd_end = c + strlen(c);
+	scrub_boot_args(c);
 }
 
 static void scrub_buildprop(char *c)
@@ -794,14 +874,14 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	char __user *ub = (char __user *)P_ARG1(regs);
 	long ret = (long)regs_return_value(regs);
 	int mode = *(int *)ri->data;
-	char buf[1024];
+	char buf[768];
 	long n;
 	if (!mode || ret <= 0 || !ub) return 0;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
 	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
 	switch (mode) {
-	case 1: scrub_boot_args(buf); break;
+	case 1: cmd_end = buf + n; scrub_boot_args(buf); break;
 	case 2: scrub_buildprop(buf); break;
 	case 3: scrub_ctx(buf); break;
 	case 4: if (buf[0] == '0') buf[0] = '1'; break;
@@ -1013,10 +1093,12 @@ static void hooks_install(void)
 
 static void hooks_remove(void)
 {
-	if (kr_name.hooked) unregister_kretprobe(&kr_name);
-	if (kp_path.hooked) unregister_kprobe(&kp_path);
+#if STAGE >= 5
 	if (iterate_addr) hook_unwrap((void *)iterate_addr, dir_before, dir_after);
 	if (piddir_addr) hook_unwrap((void *)piddir_addr, dir_before, dir_after);
+#endif
+	if (kr_name.hooked) unregister_kretprobe(&kr_name);
+	if (kp_path.hooked) unregister_kprobe(&kp_path);
 	if (kr_pread.hooked) unregister_kretprobe(&kr_pread);
 	if (kr_bprop.hooked) unregister_kretprobe(&kr_bprop);
 	if (kr_statfs.hooked) unregister_kretprobe(&kr_statfs);
@@ -1176,6 +1258,7 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		vma = mm->mmap;
 		while (kptr_ok(vma) && guard++ < 8192) {
 			const char *dn;
+			if (vma->vm_mm != mm) break;
 			if (kptr_ok(vma->vm_file) && kptr_ok(vma->vm_file->f_path.dentry)) {
 				dn = vma->vm_file->f_path.dentry->d_name.name;
 				if (kptr_ok(dn) && strstr(dn, pname)) { found = vma->vm_start; break; }
@@ -1224,7 +1307,6 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	return ret < 0 ? ret : -EIO;
 }
 
-static struct file_operations dev_fops;
 static struct miscdevice dev;
 
 static long owner_ctl(const char *ctl_args, char __user *out_msg, int outlen)
@@ -1241,6 +1323,7 @@ KPM_CTL0(owner_ctl);
 
 static long nvsvc_start(const char *args, const char *event, void *__user reserved)
 {
+	unsigned int maj = 0, min = 0;
 	int r;
 	(void)args; (void)event; (void)reserved;
 
@@ -1253,17 +1336,34 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	r = resolve_syms();
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
 
-	memset(&dev_fops, 0, sizeof(dev_fops));
-	dev_fops.unlocked_ioctl = dev_ioctl;
+	/* ---- hard kernel guard: galat build par bootloop nahi ---- */
+	if (kver_mm(&maj, &min)) {
+		pr_info("nvsvc: cannot read kernel version\n");
+		return -EINVAL;
+	}
+	if (maj < 5 || (maj == 5 && min < 4) || maj > 6) {
+		pr_info("nvsvc: kernel %u.%u unsupported\n", maj, min);
+		return -EINVAL;
+	}
+
+	fops_table(maj, min);
+	fops_probe();
+	if (uio_off != 72 && uio_off != 80) {
+		pr_info("nvsvc: bad fops offset %u\n", uio_off);
+		return -EINVAL;
+	}
+	memset(fops_buf, 0, sizeof(fops_buf));
+	fops_put(sizeof(void *), (void *)k_no_llseek);
+	fops_put(uio_off, (void *)dev_ioctl);
 #ifdef CONFIG_COMPAT
-	dev_fops.compat_ioctl = dev_ioctl;
+	fops_put(cio_off, (void *)dev_ioctl);
 #endif
-	dev_fops.llseek = k_no_llseek;
+	pr_info("nvsvc: kernel %u.%u fops uio=%u\n", maj, min, uio_off);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
 	dev.name = DEV_NAME;
-	dev.fops = &dev_fops;
+	dev.fops = fops_buf;
 	dev.mode = 0666;
 
 	pick_fake_path();
