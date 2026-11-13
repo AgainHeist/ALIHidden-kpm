@@ -1,8 +1,9 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v10  PANIC-SAFE
+//  DARKxKERNEL KPM  (nvsvc)  v11  LOAD-SAFE
 //  Owner tag: XOR-encoded + checksum-locked
 //  Kernel 3.18 - 7.x (arm64 / x86_64)
-//  fops ka HAR slot dev_ioctl -> offset galat ho to bhi panic nahi
+//  v11: load-fail fixes -- kallsyms truncation, E2BIG, hook_tr
+//       clobber, non-fatal version/misc/hook gates, open slot
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -27,8 +28,11 @@
 #  endif
 #endif
 
-#ifndef KP_HAVE_UTILS
+/* ALWAYS declare: kputils.h mil jaye to bhi ye safe hai.
+ * Warna implicit-int declaration kernel address ko 32-bit me kaat deti hai
+ * aur misc_register/hook_wrap4 ko garbage address milta hai -> load fail. */
 extern unsigned long kallsyms_lookup_name(const char *name);
+#ifndef KP_HAVE_UTILS
 extern unsigned int current_uid(void);
 #endif
 #ifdef CONFIG_COMPAT
@@ -62,7 +66,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("10.0.0");
+KPM_VERSION("10.1.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -331,6 +335,10 @@ struct kretprobe {
 #define F_FLAG f->local.data[0]
 #define F_BODY ((void *)(f->local.data + 1))
 
+/* hook_local.data[] = 8 * 8 = 64 byte; data[0] flag ke liye,
+ * body ke liye 56 byte bachte hain -- isse zyada mat maango. */
+#define KRET_BODY_MAX 56
+
 #if defined(__aarch64__)
 static void regs_in(struct pt_regs *r, hook_fargs4_t *f)
 {
@@ -427,7 +435,7 @@ static int register_kretprobe(struct kretprobe *kr)
 {
 	unsigned long addr;
 	if (!kr->kp.symbol_name) return -EINVAL;
-	if (kr->data_size > 40) return -E2BIG;
+	if (kr->data_size > KRET_BODY_MAX) return -E2BIG;
 	addr = kallsyms_lookup_name(kr->kp.symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", kr->kp.symbol_name); return -ESRCH; }
 	kr->kp.addr = (void *)addr;
@@ -494,6 +502,8 @@ struct mod_base32 { int pid; unsigned int name, base; };
 static char saved_release[__NEW_UTS_LEN + 1];
 static char saved_version[__NEW_UTS_LEN + 1];
 static int  saved_kptr;
+static int  kptr_saved;
+static int  dev_ok;
 static int  inited;
 static int  uts_ok;
 static int  strict = 1;
@@ -838,6 +848,7 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	F_FLAG = 0;
 	if (bypass() || !kptr_ok(ctx) || !kptr_ok((const void *)ctx->actor)) return;
 	if ((void *)ctx->actor == (void *)filter_actor) return;
+	if ((void *)ctx->actor == (void *)filter_actor_pid) return;
 	if (pidonly && !hide_pid) return;
 
 	s->orig = ctx;
@@ -1018,12 +1029,14 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
+/* entry_handler/handler pehle se set ho to unhe chhedo mat --
+ * varna pre_read/post_read jaise custom handlers kho jate hain. */
 static void hook_tr(struct kretprobe *kr, const char *sym, int maps)
 {
 	kr->kp.symbol_name = sym;
-	kr->entry_handler = maps ? tr_entry_maps : tr_entry;
-	kr->handler = tr_ret;
-	kr->data_size = sizeof(struct tr_data);
+	if (!kr->entry_handler) kr->entry_handler = maps ? tr_entry_maps : tr_entry;
+	if (!kr->handler) kr->handler = tr_ret;
+	if (!kr->data_size) kr->data_size = sizeof(struct tr_data);
 	kr->maxactive = 64;
 	if (!register_kretprobe(kr)) { hooks_ok++; return; }
 	memset(kr, 0, sizeof(*kr));
@@ -1166,7 +1179,9 @@ static int resolve_syms(void)
 	RS("kvfree", k_kvfree);
 	RS("access_process_vm", k_access_process_vm);
 	RS("no_llseek", k_no_llseek);
-	if (!k_misc_register || !k_misc_deregister || !k_copy_from_user) return -ESRCH;
+	/* sirf copy_from_user mandatory; misc_* / uts / cmdline optional --
+	 * inke bina bhi hooks chal sakte hain, load fail nahi hona chahiye. */
+	if (!k_copy_from_user) return -ESRCH;
 	return 0;
 }
 
@@ -1216,8 +1231,9 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 
 	if (cmd == OP_INIT) return 0;
 
-	/* galat slot se aaya call bhi safe rahe */
-	if (!user_ok(arg)) return -EINVAL;
+	/* open()/release() me arg garbage hota hai. Isliye not-a-user-pointer
+	 * par -EINVAL nahi, 0 return karo -- warna /dev/nvsvc open hi fail. */
+	if (!user_ok(arg)) return 0;
 
 	if (cmd == OP_VER) {
 		int v = (API_VER << 16) | (int)hooks_ok;
@@ -1358,10 +1374,11 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
 
 	if (kver_mm(&maj, &min)) {
-		pr_info("nvsvc: kernel version nahi padhi ja saki\n");
-		return -EINVAL;
-	}
-	if (maj < 3 || (maj == 3 && min < 18)) {
+		/* init_uts_ns data symbol hai -> KALLSYMS_ALL off par nahi milega.
+		 * fops_guess sirf cosmetic hai, isliye default maan ke aage badho. */
+		maj = 5; min = 10;
+		pr_info("nvsvc: version unknown, assuming %u.%u\n", maj, min);
+	} else if (maj < 3 || (maj == 3 && min < 18)) {
 		pr_info("nvsvc: kernel %u.%u bahut purana (3.18+ chahiye)\n", maj, min);
 		return -EINVAL;
 	}
@@ -1369,7 +1386,8 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	fops_guess(maj, min);
 
 	/* HAR slot dev_ioctl -> offset galat ho to bhi kuch nahi tootega.
-	 * slot 0 (owner) NULL rehta hai warna try_module_get crash karega. */
+	 * slot 0 (owner) NULL rehta hai warna try_module_get crash karega.
+	 * open/release bhi dev_ioctl hi hain, isliye dev_ioctl arg par 0 deta hai. */
 	memset(fops_buf, 0, sizeof(fops_buf));
 	for (off = sizeof(void *); off + sizeof(void *) <= FOPS_MAX; off += sizeof(void *))
 		fops_put(off, (const void *)dev_ioctl);
@@ -1384,28 +1402,28 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 
 	pick_fake_path();
 
-	r = k_misc_register(&dev);
-	if (r) { pr_info("nvsvc: misc_register %d\n", r); return r; }
-	pr_info("nvsvc: registered\n");
+	if (k_misc_register && k_misc_deregister) {
+		r = k_misc_register(&dev);
+		if (r) pr_info("nvsvc: misc_register %d (node skip)\n", r);
+		else { dev_ok = 1; pr_info("nvsvc: registered\n"); }
+	} else {
+		pr_info("nvsvc: misc_register missing, node skip\n");
+	}
 
 #if STAGE >= 2
 	if (k_uts) uts_scrub();
 	cmdline_scrub();
 	if (kptr_ok(k_kptr_restrict) && *k_kptr_restrict < 2) {
 		saved_kptr = *k_kptr_restrict;
+		kptr_saved = 1;
 		*k_kptr_restrict = 2;
 	}
 #endif
 
 #if STAGE >= 3
 	hooks_install();
-	if (!hooks_ok) {
-		if (kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
-		uts_restore();
-		k_misc_deregister(&dev);
-		pr_info("nvsvc: koi hook nahi, abort\n");
-		return -EIO;
-	}
+	if (!hooks_ok)
+		pr_info("nvsvc: WARN koi hook nahi laga, phir bhi loaded\n");
 #endif
 
 	inited = 1;
@@ -1419,9 +1437,9 @@ static long nvsvc_stop(void *__user reserved)
 	if (!inited) return 0;
 	inited = 0;
 	hooks_remove();
-	if (kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
+	if (kptr_saved && kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
 	uts_restore();
-	if (k_misc_deregister) k_misc_deregister(&dev);
+	if (dev_ok && k_misc_deregister) { k_misc_deregister(&dev); dev_ok = 0; }
 	return 0;
 }
 
