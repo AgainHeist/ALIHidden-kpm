@@ -27,6 +27,7 @@ ck "debuggable"        "getprop ro.debuggable"                             "0"
 ck "tags"              "getprop ro.build.tags"                             "release-keys"
 ck "config.gz hidden"  "ls /proc/config.gz 2>&1 | grep -c 'No such'"       "1"
 ck "magisk pkg gone"   "pm list packages 2>/dev/null | grep -c topjohnwu"  "1"
+ck "kpatch token"      "grep -c kpatch /proc/version"                      "1"
 ck "owner tag"         "dmesg | grep -c 'nvsvc: Owner By ali'"             "1"
 ck "hooks live"        "dmesg | grep -c 'nvsvc: loaded'"                   "1"
 
