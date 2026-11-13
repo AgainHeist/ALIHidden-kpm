@@ -1,13 +1,10 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v13  LOAD-SAFE
-//  v13 fixes (v12 ke upar):
-//   - uts: "kpatch" token preserve (APatch jailbreak-mode fix),
-//     release sirf APatch/KSU/Magisk marker par cut
-//   - fops: fill-all hata, sirf llseek/read/write/poll/ioctl,
-//     mmap_supported_flags ab NULL (pehle function ptr tha)
-//   - seq scrub: fresh seq_file (count==0) skip ho raha tha
-//   - compat: in_compat_syscall fallback + OP_ABI force
-//   - OP_UTS runtime toggle
+//  DARKxKERNEL KPM  (nvsvc)  v14  APATCH-COMPAT
+//  v14:
+//   - default strict=0 -> root bypass (APatch kp/kpatchd kaam kare)
+//   - manager uid whitelist + auto-detect (inode uid se)
+//   - kptr_restrict = 1 (2 root se bhi chhupa deta tha)
+//   - version me "kpatch" token force (Full mode detect)
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -58,7 +55,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("12.0.0");
+KPM_VERSION("13.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -148,6 +145,7 @@ struct kp_dentry {
 	struct kp_hlist_bl_node d_hash;
 	struct kp_dentry *d_parent;
 	struct kp_qstr d_name;
+	struct inode *d_inode;
 };
 
 struct kp_path { struct vfsmount *mnt; struct kp_dentry *dentry; };
@@ -273,9 +271,6 @@ static void fops_put(unsigned int off, const void *fn)
 		*(const void **)(fops_buf + off) = fn;
 }
 
-/* < 4.7  : poll = 7, unlocked_ioctl = 8, compat_ioctl = 9
- * >= 4.7 : poll = 9, unlocked_ioctl = 10, compat_ioctl = 11
- * llseek / read / write dono layouts me 1 / 2 / 3. */
 static void fops_layout(unsigned int maj, unsigned int min)
 {
 	unsigned long v = (unsigned long)maj * 100 + min;
@@ -467,7 +462,8 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_VER     0x806
 #define OP_ABI     0x807
 #define OP_UTS     0x808
-#define API_VER    5
+#define OP_MUID    0x809
+#define API_VER    6
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -489,15 +485,24 @@ static int  kptr_saved;
 static int  dev_ok;
 static int  inited;
 static int  uts_ok;
-static int  strict = 1;
+static int  strict;          /* 0 = root bypass (default), 1 = strict, 2 = off */
 static int  hide_pid;
+static int  mgr_uid = -1;
 static int  abi_force = -1;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
 static unsigned long iterate_addr, piddir_addr;
 static char *cmd_end;
 
-static int bypass(void) { return current_uid() == 0 && !strict; }
+/* root + manager app bypass, taaki APatch ka kp/kpatchd kaam kare */
+static int bypass(void)
+{
+	unsigned int u;
+	if (strict == 2) return 1;
+	u = current_uid();
+	if (u == 0) return strict ? 0 : 1;
+	return mgr_uid > 0 && (int)u == mgr_uid;
+}
 
 static const char *const hidden[] = {
 	"/data/adb", "/sbin/su", "/system/bin/su", "/system/xbin/su",
@@ -606,23 +611,9 @@ static int kver_mm(unsigned int *maj, unsigned int *min)
 }
 
 /* ---------- uts ---------- */
-static const char *const uts_mark[] = {
-	"APatch", "KernelSU", "kpatch", "KPM", "Magisk", "SukiSU", "ReSukiSU",
-};
-
-/* kpatch ko chhod ke -- APatch isi token se patched kernel detect karta hai,
- * isliye release cut-list me "kpatch" nahi hai */
 static const char *const uts_cut[] = {
 	"APatch", "KernelSU", "KPM", "Magisk", "SukiSU", "ReSukiSU",
 };
-
-static int uts_marked(const char *s)
-{
-	unsigned int i;
-	for (i = 0; i < ARRAY_SIZE(uts_mark); i++)
-		if (strstr(s, uts_mark[i])) return 1;
-	return 0;
-}
 
 static int uts_cut_marked(const char *s)
 {
@@ -656,6 +647,7 @@ static int uts_layout_ok(void)
 static void uts_scrub(void)
 {
 	char *r, *v, *c;
+	long l;
 
 	if (uts_ok) return;
 	if (!uts_layout_ok()) {
@@ -679,6 +671,14 @@ static void uts_scrub(void)
 	blank_word(v, "Magisk");
 	c = v + strlen(v);
 	while (c > v && c[-1] == ' ') *--c = '\0';
+
+	/* APatch Full/LKM mode isi token se decide karta hai. Agar scrub ke
+	 * baad token gayab ho gaya ho to wapas likh do. */
+	if (!strstr(v, "kpatch")) {
+		l = (long)strlen(v);
+		if (l + 8 < (long)sizeof(k_uts->name.version))
+			memcpy(v + l, " kpatch", 8);
+	}
 }
 
 static void uts_restore(void)
@@ -687,6 +687,35 @@ static void uts_restore(void)
 	memcpy(k_uts->name.release, saved_release, sizeof(saved_release));
 	memcpy(k_uts->name.version, saved_version, sizeof(saved_version));
 	uts_ok = 0;
+}
+
+/* ---------- manager uid detect ---------- */
+static const char *const mgr_path[] = {
+	"/data/data/me.bmax.apatch",
+	"/data/data/me.weishu.kernelsu",
+	"/data/data/com.topjohnwu.magisk",
+	"/data/data/com.dergoogler.mmrl",
+	"/data/adb/ap",
+	"/data/adb/ksu",
+};
+
+/* inode->i_uid offset 4 par hai (i_mode u16, i_opflags u16, i_uid kuid_t) */
+static void detect_mgr_uid(void)
+{
+	struct kp_path p;
+	unsigned int i, uid;
+
+	if (!k_kern_path || !k_path_put) return;
+	for (i = 0; i < ARRAY_SIZE(mgr_path); i++) {
+		if (k_kern_path(mgr_path[i], LOOKUP_FOLLOW, &p)) continue;
+		if (kptr_ok(p.dentry) && kptr_ok(p.dentry->d_inode)) {
+			uid = *(unsigned int *)((char *)p.dentry->d_inode + 4);
+			if (uid > 0 && uid < 20000) mgr_uid = (int)uid;
+		}
+		k_path_put(&p);
+		if (mgr_uid > 0) break;
+	}
+	if (mgr_uid > 0) pr_info("nvsvc: mgr uid %d\n", mgr_uid);
 }
 
 /* ---------- bootloader / props ---------- */
@@ -1261,13 +1290,19 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	if (cmd == OP_STRICT) {
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
-		strict = !!v;
+		strict = v;
 		return 0;
 	}
 	if (cmd == OP_HIDE) {
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
 		hide_pid = v;
+		return 0;
+	}
+	if (cmd == OP_MUID) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		mgr_uid = v;
 		return 0;
 	}
 	if (cmd == OP_ABI) {
@@ -1405,7 +1440,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 		pr_info("nvsvc: owner tag tampered\n");
 		return -EIO;
 	}
-	pr_info("nvsvc: %s (stage %d)\n", owner_name, STAGE);
+	pr_info("nvsvc: %s (stage %d, strict %d)\n", owner_name, STAGE, strict);
 
 	r = resolve_syms();
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
@@ -1436,7 +1471,9 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	dev.fops = (const struct kp_fops *)fops_buf;
 	dev.mode = 0666;
 
+	/* hooks se pehle -- warna lookup khud redirect ho jayega */
 	pick_fake_path();
+	detect_mgr_uid();
 
 	if (k_misc_register && k_misc_deregister) {
 		r = k_misc_register(&dev);
@@ -1449,10 +1486,12 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 #if STAGE >= 2
 	if (k_uts) uts_scrub();
 	cmdline_scrub();
-	if (kptr_ok(k_kptr_restrict) && *k_kptr_restrict < 2) {
+	/* 1 = sirf CAP_SYSLOG (root) ko dikhe -- APatch kp/kpatchd isse
+	 * kallsyms padhta hai, 2 karne se wo bhi andha ho jata tha */
+	if (kptr_ok(k_kptr_restrict) && *k_kptr_restrict < 1) {
 		saved_kptr = *k_kptr_restrict;
 		kptr_saved = 1;
-		*k_kptr_restrict = 2;
+		*k_kptr_restrict = 1;
 	}
 #endif
 
