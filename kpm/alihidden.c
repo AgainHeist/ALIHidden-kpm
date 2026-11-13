@@ -1,7 +1,6 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v3
-//  Owner tag: XOR-encoded + checksum-locked (tamper proof)
-//  Userspace protocol: /dev/nvsvc -> DarkXKernal
+//  DARKxKERNEL KPM  (nvsvc)  v4
+//  Owner tag: XOR-encoded + checksum-locked
 //  Kernel 5.4 - 6.1 (arm64 / x86_64)
 // ============================================================
 #include <ktypes.h>
@@ -16,7 +15,6 @@
 #include <linux/ptrace.h>
 #include <linux/uaccess.h>
 
-/* ---- KP header compat (kputils.h naye KP se hata hai) ---- */
 #if defined(__has_include)
 #  if __has_include(<kputils.h>)
 #    include <kputils.h>
@@ -38,12 +36,12 @@ extern int in_compat_syscall(void);
 #  endif
 #endif
 
-#ifndef KPM
-#define KPM 1
+#ifndef STAGE
+#define STAGE 6
 #endif
 
 /* ============================================================
- *  OWNER TAG  (binary se naam badla to load hi nahi hoga)
+ *  OWNER TAG
  * ============================================================ */
 #define NAME_KEY 0x5A
 #define NAME_SUM 0x1B25
@@ -63,7 +61,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("3.0.0");
+KPM_VERSION("4.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -132,7 +130,7 @@ KPM_DESCRIPTION("system service");
 #endif
 
 /* ============================================================
- *  KERNEL STRUCT SHIMS  (5.4 - 6.1 layouts)
+ *  KERNEL STRUCT SHIMS (5.4 - 6.1)
  * ============================================================ */
 struct module;
 struct inode;
@@ -141,7 +139,6 @@ struct pid;
 struct task_struct;
 struct anon_vma;
 struct vm_operations_struct;
-struct cred;
 
 struct qstr { unsigned int hash; unsigned int len; const unsigned char *name; };
 struct hlist_bl_node { struct hlist_bl_node *next, **pprev; };
@@ -155,7 +152,12 @@ struct dentry {
 };
 
 struct path { struct vfsmount *mnt; struct dentry *dentry; };
-struct file { struct path f_path; };
+
+/* f_u (llist/rcu_head union) = 16 byte, f_path uske BAAD */
+struct file {
+	void *f_u[2];
+	struct path f_path;
+};
 
 struct dir_context {
 	bool (*actor)(struct dir_context *, const char *, int, loff_t, u64, unsigned);
@@ -251,6 +253,13 @@ static struct kp_utsns *k_uts;
 #define copy_to_user(to, from, n)   (compat_copy_to_user((to), (from), (int)(n)))
 #define strncpy_from_user(d, s, n)  (compat_strncpy_from_user((d), (s), (n)))
 #define kp_get_user_byte(dst, src)  copy_from_user((dst), (src), 1)
+
+/* kernel pointer sanity */
+static int kptr_ok(const void *p)
+{
+	unsigned long a = (unsigned long)p;
+	return a >= 0xffff000000000000UL && a != ~0UL;
+}
 
 /* ============================================================
  *  kprobe / kretprobe over KP inline hooks
@@ -424,7 +433,7 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_HIDE    0x804
 #define OP_STRICT  0x805
 #define OP_VER     0x806
-#define API_VER    2
+#define API_VER    3
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -445,6 +454,7 @@ static char saved_release[__NEW_UTS_LEN + 1];
 static char saved_version[__NEW_UTS_LEN + 1];
 static int  saved_kptr;
 static int  inited;
+static int  uts_ok;
 static int  strict = 1;
 static int  hide_pid;
 static unsigned int hooks_ok;
@@ -546,9 +556,19 @@ static void blank_word(char *b, const char *w)
 /* ---------- uts ---------- */
 static void uts_scrub(void)
 {
-	char *r = k_uts->name.release, *v = k_uts->name.version, *c;
+	char *r, *v, *c;
+
+	if (!kptr_ok(k_uts)) return;
+	if (strncmp(k_uts->name.sysname, "Linux", 5)) {
+		pr_info("nvsvc: uts shim mismatch, skip\n");
+		return;
+	}
+	r = k_uts->name.release;
+	v = k_uts->name.version;
 	memcpy(saved_release, r, sizeof(saved_release));
 	memcpy(saved_version, v, sizeof(saved_version));
+	uts_ok = 1;
+
 	c = strpbrk(r, "-+");
 	if (c) *c = '\0';
 	blank_word(v, "APatch");
@@ -562,6 +582,7 @@ static void uts_scrub(void)
 
 static void uts_restore(void)
 {
+	if (!uts_ok || !kptr_ok(k_uts)) return;
 	memcpy(k_uts->name.release, saved_release, sizeof(saved_release));
 	memcpy(k_uts->name.version, saved_version, sizeof(saved_version));
 }
@@ -624,9 +645,9 @@ static void scrub_boot_args(char *c)
 static void cmdline_scrub(void)
 {
 	char *c;
-	if (!k_saved_cmdline) return;
+	if (!k_saved_cmdline || !kptr_ok(k_saved_cmdline)) return;
 	c = *k_saved_cmdline;
-	if (c) scrub_boot_args(c);
+	if (c && kptr_ok(c)) scrub_boot_args(c);
 }
 
 static void scrub_buildprop(char *c)
@@ -673,8 +694,8 @@ static int name_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gp_data *d = (struct gp_data *)ri->data;
 	struct filename *fn = (struct filename *)P_RET(regs);
-	if (d->hide && fn && !IS_ERR(fn) && fn->name)
-		kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
+	if (!d->hide || !kptr_ok(fn) || IS_ERR(fn) || !kptr_ok(fn->name)) return 0;
+	kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
 	return 0;
 }
 
@@ -686,12 +707,13 @@ static int pre_path(struct kprobe *p, struct pt_regs *regs)
 	(void)p;
 	if (bypass()) return 0;
 	fn = (struct filename *)P_ARG1(regs);
-	if (fn && fn->name && is_hidden(fn->name))
+	if (!kptr_ok(fn) || !kptr_ok(fn->name)) return 0;
+	if (is_hidden(fn->name))
 		kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
 	return 0;
 }
 
-/* ---------- dir filter (per-call shadow, race-free) ---------- */
+/* ---------- dir filter ---------- */
 struct shadow { struct dir_context dc; struct dir_context *orig; int pidonly; };
 
 static bool filter_actor(struct dir_context *c, const char *name, int namlen,
@@ -723,7 +745,7 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	int pidonly = (int)(unsigned long)ud;
 
 	f->local.data[7] = 0;
-	if (bypass() || !ctx || !ctx->actor) return;
+	if (bypass() || !kptr_ok(ctx) || !kptr_ok(ctx->actor)) return;
 	if ((void *)ctx->actor == (void *)filter_actor) return;
 	if (pidonly && !hide_pid) return;
 
@@ -752,15 +774,15 @@ static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	int *mode = (int *)ri->data;
 	const char *n;
 	*mode = 0;
-	if (bypass() || !f || !f->f_path.dentry) return 0;
+	if (bypass() || !kptr_ok(f) || !kptr_ok(f->f_path.dentry)) return 0;
 	n = f->f_path.dentry->d_name.name;
-	if (!n) return 0;
+	if (!kptr_ok(n)) return 0;
 	if (!strncmp(n, "bootargs", 8)) { *mode = 1; return 1; }
 	if (!strcmp(n, "build.prop")) { *mode = 2; return 1; }
 	if (!strcmp(n, "current")) {
-		const char *pn = f->f_path.dentry->d_parent ?
+		const char *pn = kptr_ok(f->f_path.dentry->d_parent) ?
 			f->f_path.dentry->d_parent->d_name.name : NULL;
-		if (pn && !strcmp(pn, "attr")) { *mode = 3; return 1; }
+		if (kptr_ok(pn) && !strcmp(pn, "attr")) { *mode = 3; return 1; }
 		return 0;
 	}
 	if (!strcmp(n, "enforce")) { *mode = 4; return 1; }
@@ -774,7 +796,7 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	int mode = *(int *)ri->data;
 	char buf[1024];
 	long n;
-	if (!mode || ret <= 0) return 0;
+	if (!mode || ret <= 0 || !ub) return 0;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
 	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
@@ -802,7 +824,7 @@ static int post_statfs(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct kstatfs *st = (struct kstatfs *)P_ARG1(regs);
 	(void)ri;
-	if (bypass() || !st) return 0;
+	if (bypass() || !kptr_ok(st)) return 0;
 	if (st->f_type == OVERLAY_MAGIC) st->f_type = EXT4_MAGIC;
 	return 0;
 }
@@ -825,7 +847,7 @@ static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 	long ret = (long)regs_return_value(regs);
 	char buf[64];
 	long n;
-	if (!*(int *)ri->data || ret <= 0) return 0;
+	if (!*(int *)ri->data || ret <= 0 || !ub) return 0;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
 	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
@@ -845,7 +867,8 @@ static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct tr_data *d = (struct tr_data *)ri->data;
 	struct seq_file *m = (struct seq_file *)P_ARG0(regs);
 	d->m = m; d->saved = 0; d->maps = 0;
-	if (bypass() || !m || !m->buf || m->size < m->count || m->size > 0x100000) return 0;
+	if (bypass() || !kptr_ok(m) || !kptr_ok(m->buf)) return 0;
+	if (m->size < m->count || m->size > 0x100000) return 0;
 	d->saved = (long)m->count;
 	return 1;
 }
@@ -887,7 +910,7 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct seq_file *m = d->m;
 	long i, o, end;
 	(void)regs;
-	if (!d->saved || !m || (long)m->count <= d->saved) return 0;
+	if (!d->saved || !kptr_ok(m) || (long)m->count <= d->saved) return 0;
 	zero_tracer(m->buf, d->saved, (long)m->count);
 	if (d->maps) defang_perms(m->buf, d->saved, (long)m->count);
 	i = d->saved; end = (long)m->count; o = d->saved;
@@ -915,6 +938,7 @@ static void hook_tr(struct kretprobe *kr, const char *sym, int maps)
 
 static void hooks_install(void)
 {
+#if STAGE >= 3
 	kr_name.entry_handler = name_entry;
 	kr_name.handler = name_ret;
 	if (!register_kretprobe(&kr_name)) hooks_ok++;
@@ -924,23 +948,10 @@ static void hooks_install(void)
 		kp_path.pre_handler = pre_path;
 		if (!register_kprobe(&kp_path)) hooks_ok++;
 	}
+	pr_info("nvsvc: stage3 %u\n", hooks_ok);
+#endif
 
-	iterate_addr = (unsigned long)kallsyms_lookup_name("iterate_dir");
-	if (iterate_addr &&
-	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0)) {
-		hooks_ok++;
-	} else {
-		iterate_addr = 0;
-	}
-
-	piddir_addr = (unsigned long)kallsyms_lookup_name("proc_pid_readdir");
-	if (piddir_addr &&
-	    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1)) {
-		hooks_ok++;
-	} else {
-		piddir_addr = 0;
-	}
-
+#if STAGE >= 4
 	kr_pread.data_size = sizeof(int);
 	kr_bprop.data_size = sizeof(int);
 	kr_pread.entry_handler = pre_read;
@@ -965,7 +976,27 @@ static void hooks_install(void)
 	kr_rl.maxactive = 64;
 	if (!register_kretprobe(&kr_rl)) hooks_ok++;
 	else memset(&kr_rl, 0, sizeof(kr_rl));
+	pr_info("nvsvc: stage4 %u\n", hooks_ok);
+#endif
 
+#if STAGE >= 5
+	iterate_addr = (unsigned long)kallsyms_lookup_name("iterate_dir");
+	if (iterate_addr &&
+	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0))
+		hooks_ok++;
+	else
+		iterate_addr = 0;
+
+	piddir_addr = (unsigned long)kallsyms_lookup_name("proc_pid_readdir");
+	if (piddir_addr &&
+	    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1))
+		hooks_ok++;
+	else
+		piddir_addr = 0;
+	pr_info("nvsvc: stage5 %u\n", hooks_ok);
+#endif
+
+#if STAGE >= 6
 	hook_tr(&kr_mounts, "show_vfsmnt", 0);
 	hook_tr(&kr_mountinfo, "show_mountinfo", 0);
 	hook_tr(&kr_modules, "m_show", 0);
@@ -976,6 +1007,8 @@ static void hooks_install(void)
 	hook_tr(&kr_maps, "show_map_vma", 1);
 	hook_tr(&kr_smaps, "show_smap", 1);
 	hook_tr(&kr_roll, "smaps_rollup_show", 1);
+	pr_info("nvsvc: stage6 %u\n", hooks_ok);
+#endif
 }
 
 static void hooks_remove(void)
@@ -1141,13 +1174,13 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		if (!mm) return -ESRCH;
 
 		vma = mm->mmap;
-		while (vma && guard++ < 8192) {
+		while (kptr_ok(vma) && guard++ < 8192) {
 			const char *dn;
-			if (vma->vm_file && vma->vm_file->f_path.dentry) {
+			if (kptr_ok(vma->vm_file) && kptr_ok(vma->vm_file->f_path.dentry)) {
 				dn = vma->vm_file->f_path.dentry->d_name.name;
-				if (dn && strstr(dn, pname)) { found = vma->vm_start; break; }
+				if (kptr_ok(dn) && strstr(dn, pname)) { found = vma->vm_start; break; }
 			}
-			if (vma->vm_next && vma->vm_next <= vma) break;
+			if (!kptr_ok(vma->vm_next) || vma->vm_next <= vma) break;
 			vma = vma->vm_next;
 		}
 		if (k_mmput) k_mmput(mm);
@@ -1194,7 +1227,6 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 static struct file_operations dev_fops;
 static struct miscdevice dev;
 
-/* owner tag reader: kpatch kpm ctl "Owner By ali" */
 static long owner_ctl(const char *ctl_args, char __user *out_msg, int outlen)
 {
 	int n = 0;
@@ -1212,12 +1244,11 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	int r;
 	(void)args; (void)event; (void)reserved;
 
-	/* tamper lock: encoded tag must match checksum */
 	if (!name_decode()) {
 		pr_info("nvsvc: owner tag tampered\n");
 		return -EIO;
 	}
-	pr_info("nvsvc: %s\n", owner_name);
+	pr_info("nvsvc: %s (stage %d)\n", owner_name, STAGE);
 
 	r = resolve_syms();
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
@@ -1239,21 +1270,27 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 
 	r = k_misc_register(&dev);
 	if (r) { pr_info("nvsvc: misc_register %d\n", r); return r; }
+	pr_info("nvsvc: registered\n");
 
+#if STAGE >= 2
 	if (k_uts) uts_scrub();
 	cmdline_scrub();
-	if (k_kptr_restrict) { saved_kptr = *k_kptr_restrict; *k_kptr_restrict = 2; }
+	if (kptr_ok(k_kptr_restrict)) {
+		saved_kptr = *k_kptr_restrict;
+		*k_kptr_restrict = 2;
+	}
+#endif
 
+#if STAGE >= 3
 	hooks_install();
-
 	if (!hooks_ok) {
-		/* kuch bhi hook nahi laga -> safai karke fail */
-		if (k_kptr_restrict) *k_kptr_restrict = saved_kptr;
-		if (k_uts) uts_restore();
+		if (kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
+		uts_restore();
 		k_misc_deregister(&dev);
 		pr_info("nvsvc: no hooks, aborted\n");
 		return -EIO;
 	}
+#endif
 
 	inited = 1;
 	pr_info("nvsvc: loaded, %u hooks\n", hooks_ok);
@@ -1266,8 +1303,8 @@ static long nvsvc_stop(void *__user reserved)
 	if (!inited) return 0;
 	inited = 0;
 	hooks_remove();
-	if (k_kptr_restrict) *k_kptr_restrict = saved_kptr;
-	if (k_uts) uts_restore();
+	if (kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
+	uts_restore();
 	if (k_misc_deregister) k_misc_deregister(&dev);
 	return 0;
 }
