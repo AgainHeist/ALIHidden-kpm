@@ -1,8 +1,8 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v6
+//  DARKxKERNEL KPM  (nvsvc)  v8  FINAL
 //  Owner tag: XOR-encoded + checksum-locked
-//  Kernel 5.4 - 6.12+ (arm64 / x86_64)  |  version-guarded
-//  Koi kernel-type dependency nahi, sab local shim
+//  Kernel 3.18 - 7.x (arm64 / x86_64)  |  layout-aware
+//  Sab shim local, koi kernel type dependency nahi
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -28,7 +28,7 @@
 #endif
 
 #ifndef KP_HAVE_UTILS
-extern void *kallsyms_lookup_name(const char *name);
+extern unsigned long kallsyms_lookup_name(const char *name);
 extern unsigned int current_uid(void);
 #endif
 #ifdef CONFIG_COMPAT
@@ -62,7 +62,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("6.0.0");
+KPM_VERSION("8.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -131,8 +131,7 @@ KPM_DESCRIPTION("system service");
 #endif
 
 /* ============================================================
- *  KERNEL STRUCT SHIMS (5.4 - 6.12)   --  sab local, koi include
- *  par depend nahi (list_head / umode_t / filename bhi shim)
+ *  KERNEL STRUCT SHIMS (3.18 - 7.x)
  * ============================================================ */
 struct module;
 struct inode;
@@ -141,7 +140,6 @@ struct pid;
 struct task_struct;
 struct anon_vma;
 struct vm_operations_struct;
-struct mm_struct;
 
 struct qstr { unsigned int hash; unsigned int len; const unsigned char *name; };
 struct hlist_bl_node { struct hlist_bl_node *next, **pprev; };
@@ -162,24 +160,39 @@ struct file {
 	struct path f_path;
 };
 
+/* kernel ka struct filename -> pehla field hi name hai */
+struct kp_filename { const char *name; };
+
 struct dir_context {
 	bool (*actor)(struct dir_context *, const char *, int, loff_t, u64, unsigned);
 	loff_t pos;
 };
 
-/* kernel ka struct filename -> pehla field hi name hai */
-struct kp_filename { const char *name; };
+struct file_operations {
+	struct module *owner;
+	loff_t (*llseek)(struct file *, loff_t, int);
+	ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
+	void *read_iter;
+	void *write_iter;
+	void *iopoll;
+	void *iterate;
+	void *iterate_shared;
+	void *poll;
+	long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
+};
 
 struct miscdevice {
 	int minor;
 	const char *name;
-	const void *fops;
-	void *list[2];          /* struct list_head */
+	const struct file_operations *fops;
+	struct list_head list;
 	void *parent;
 	void *this_device;
 	const void *groups;
 	const char *nodename;
-	unsigned short mode;    /* umode_t */
+	umode_t mode;
 };
 
 struct seq_file { char *buf; size_t size; size_t from; size_t count; };
@@ -197,7 +210,7 @@ struct vm_area_struct {
 	unsigned long vm_page_prot;
 	unsigned long vm_flags;
 	void *vm_shared[4];
-	void *anon_vma_chain[2];
+	struct list_head anon_vma_chain;
 	struct anon_vma *anon_vma;
 	const struct vm_operations_struct *vm_ops;
 	unsigned long vm_pgoff;
@@ -252,48 +265,54 @@ static int kptr_ok(const void *p)
 }
 
 /* ============================================================
- *  file_operations  ->  offset self-calibration
- *  layout version ke hisaab se badalta hai, isliye zeroed buffer
- *  + computed offset (hardcoded cast nahi)
+ *  file_operations offset  ->  layout-agnostic
+ *  primary: def_chr_fops probe (usme sirf .open set hota hai)
+ *  fallback: version table
  * ============================================================ */
 #define FOPS_MAX 384
 static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
 static unsigned int uio_off, cio_off;
 
-static void fops_put(unsigned int off, void *fn)
+static void fops_put(unsigned int off, const void *fn)
 {
 	if (off && off + sizeof(void *) <= FOPS_MAX)
-		*(void **)(fops_buf + off) = fn;
+		*(const void **)(fops_buf + off) = fn;
 }
 
-/* owner(0) llseek(1) read(2) write(3) read_iter(4) write_iter(5)
- * iopoll(6) [iterate(7)] iterate_shared poll unlocked_ioctl ...
- * 'iterate' 6.6 me hata hai -> 5.4-6.5 = 80, 6.6+ = 72 */
-static void fops_table(unsigned int maj, unsigned int min)
+static int fops_offsets(unsigned int maj, unsigned int min)
 {
-	unsigned int idx = 10;
-	if (maj > 6 || (maj == 6 && min >= 6))
-		idx = 9;
+	const unsigned long *p;
+	unsigned int i, idx, delta;
+
+	/* unlocked_ioctl ke baad: compat_ioctl, mmap,
+	 * [mmap_supported_flags 4.20+], open  ->  delta 3 ya 4 */
+	delta = (maj > 4 || (maj == 4 && min >= 20)) ? 4 : 3;
+
+	p = (const unsigned long *)kallsyms_lookup_name("def_chr_fops");
+	if (p) {
+		for (i = 8; i < 18; i++) {
+			if (!kptr_ok((const void *)p[i])) continue;
+			if (i < delta + 6) return -EINVAL;
+			idx = i - delta;
+			if (idx < 6 || idx > 12) return -EINVAL;
+			uio_off = idx * (unsigned int)sizeof(void *);
+			cio_off = uio_off + (unsigned int)sizeof(void *);
+			pr_info("nvsvc: fops probe uio=%u\n", uio_off);
+			return 0;
+		}
+	}
+
+	/* table fallback */
+	if (maj >= 7) idx = 9;
+	else if (maj == 6) idx = (min >= 6) ? 9 : 10;
+	else if (maj == 5) idx = (min == 0) ? 9 : 10;
+	else if (maj == 4) idx = (min >= 7) ? 9 : 8;
+	else idx = 8;
+
 	uio_off = idx * (unsigned int)sizeof(void *);
 	cio_off = uio_off + (unsigned int)sizeof(void *);
-}
-
-/* def_chr_fops me sirf .open set hota hai -> offset cross-check */
-static void fops_probe(void)
-{
-	const unsigned long *p = (const unsigned long *)kallsyms_lookup_name("def_chr_fops");
-	unsigned int i, off;
-
-	if (!p) return;
-	for (i = 4; i < 20; i++) {
-		if (!kptr_ok((const void *)p[i])) continue;
-		off = (i - 4) * (unsigned int)sizeof(void *);
-		if (off != 72 && off != 80) return;
-		uio_off = off;
-		cio_off = off + (unsigned int)sizeof(void *);
-		pr_info("nvsvc: fops probe uio=%u\n", off);
-		return;
-	}
+	pr_info("nvsvc: fops table uio=%u\n", uio_off);
+	return (uio_off >= 48 && uio_off <= 104) ? 0 : -EINVAL;
 }
 
 /* ============================================================
@@ -402,7 +421,7 @@ static int register_kprobe(struct kprobe *p)
 {
 	unsigned long addr;
 	if (!p->symbol_name) return -EINVAL;
-	addr = (unsigned long)kallsyms_lookup_name(p->symbol_name);
+	addr = kallsyms_lookup_name(p->symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", p->symbol_name); return -ESRCH; }
 	p->addr = (void *)addr;
 	if (hook_wrap4(p->addr, kprobe_before, kprobe_after, p)) { p->addr = 0; return -EIO; }
@@ -422,7 +441,7 @@ static int register_kretprobe(struct kretprobe *kr)
 	unsigned long addr;
 	if (!kr->kp.symbol_name) return -EINVAL;
 	if (kr->data_size > 48) return -E2BIG;
-	addr = (unsigned long)kallsyms_lookup_name(kr->kp.symbol_name);
+	addr = kallsyms_lookup_name(kr->kp.symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", kr->kp.symbol_name); return -ESRCH; }
 	kr->kp.addr = (void *)addr;
 	if (hook_wrap4(kr->kp.addr, kret_before, kret_after, kr)) { kr->kp.addr = 0; return -EIO; }
@@ -468,7 +487,7 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_HIDE    0x804
 #define OP_STRICT  0x805
 #define OP_VER     0x806
-#define API_VER    3
+#define API_VER    4
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -516,7 +535,7 @@ static const char *const hidden[] = {
 	"/data/user/0/me.bmax.apatch",
 	"/data/user_de/0/me.bmax.apatch",
 	"/data/local/tmp", "/proc/config.gz", "/sys/module/nvsvc",
-	"/data/misc/.__np",
+	"/sys/class/misc/nvsvc", "/data/misc/.__np",
 };
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
@@ -589,7 +608,7 @@ static void blank_word(char *b, const char *w)
 	while ((p = strstr(p, w))) { memset(p, ' ', n); p += n; }
 }
 
-/* ---------- version ---------- */
+/* ---------- kernel version ---------- */
 static int kver_mm(unsigned int *maj, unsigned int *min)
 {
 	const char *p;
@@ -1065,14 +1084,14 @@ static void hooks_install(void)
 #endif
 
 #if STAGE >= 5
-	iterate_addr = (unsigned long)kallsyms_lookup_name("iterate_dir");
+	iterate_addr = kallsyms_lookup_name("iterate_dir");
 	if (iterate_addr &&
 	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0))
 		hooks_ok++;
 	else
 		iterate_addr = 0;
 
-	piddir_addr = (unsigned long)kallsyms_lookup_name("proc_pid_readdir");
+	piddir_addr = kallsyms_lookup_name("proc_pid_readdir");
 	if (piddir_addr &&
 	    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1))
 		hooks_ok++;
@@ -1133,13 +1152,14 @@ static void pick_fake_path(void)
 }
 
 /* ---------- symbols ---------- */
-#define RS(name, slot) do { *(void **)&(slot) = kallsyms_lookup_name(name); \
+#define RS(name, slot) do { *(void **)&(slot) = (void *)kallsyms_lookup_name(name); \
 	if (!(slot)) pr_info("nvsvc: missing %s\n", name); } while (0)
 
 static int resolve_syms(void)
 {
 	RS("_copy_from_user", k_copy_from_user);
 	if (!k_copy_from_user) RS("__arch_copy_from_user", k_copy_from_user);
+	if (!k_copy_from_user) RS("__copy_from_user", k_copy_from_user);
 	RS("kptr_restrict", k_kptr_restrict);
 	RS("saved_command_line", k_saved_cmdline);
 	RS("init_uts_ns", k_uts);
@@ -1342,34 +1362,31 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	r = resolve_syms();
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
 
-	/* ---- hard kernel guard: galat build par bootloop nahi ---- */
+	/* ---- hard guard: galat kernel par bootloop nahi ---- */
 	if (kver_mm(&maj, &min)) {
-		pr_info("nvsvc: cannot read kernel version\n");
+		pr_info("nvsvc: kernel version nahi padhi ja saki\n");
 		return -EINVAL;
 	}
-	if (maj < 5 || (maj == 5 && min < 4) || maj > 6) {
-		pr_info("nvsvc: kernel %u.%u unsupported\n", maj, min);
+	if (maj < 3 || (maj == 3 && min < 18)) {
+		pr_info("nvsvc: kernel %u.%u bahut purana (3.18+ chahiye)\n", maj, min);
 		return -EINVAL;
 	}
 
-	fops_table(maj, min);
-	fops_probe();
-	if (uio_off != 72 && uio_off != 80) {
-		pr_info("nvsvc: bad fops offset %u\n", uio_off);
-		return -EINVAL;
-	}
+	r = fops_offsets(maj, min);
+	if (r) { pr_info("nvsvc: fops offset resolve fail\n"); return r; }
+
 	memset(fops_buf, 0, sizeof(fops_buf));
-	fops_put((unsigned int)sizeof(void *), (void *)k_no_llseek);
-	fops_put(uio_off, (void *)dev_ioctl);
+	fops_put((unsigned int)sizeof(void *), (const void *)k_no_llseek);
+	fops_put(uio_off, (const void *)dev_ioctl);
 #ifdef CONFIG_COMPAT
-	fops_put(cio_off, (void *)dev_ioctl);
+	fops_put(cio_off, (const void *)dev_ioctl);
 #endif
-	pr_info("nvsvc: kernel %u.%u fops uio=%u\n", maj, min, uio_off);
+	pr_info("nvsvc: kernel %u.%u uio=%u cio=%u\n", maj, min, uio_off, cio_off);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
 	dev.name = DEV_NAME;
-	dev.fops = fops_buf;
+	dev.fops = (const struct file_operations *)fops_buf;
 	dev.mode = 0666;
 
 	pick_fake_path();
@@ -1381,7 +1398,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 #if STAGE >= 2
 	if (k_uts) uts_scrub();
 	cmdline_scrub();
-	if (kptr_ok(k_kptr_restrict)) {
+	if (kptr_ok(k_kptr_restrict) && *k_kptr_restrict < 2) {
 		saved_kptr = *k_kptr_restrict;
 		*k_kptr_restrict = 2;
 	}
@@ -1393,7 +1410,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 		if (kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
 		uts_restore();
 		k_misc_deregister(&dev);
-		pr_info("nvsvc: no hooks, aborted\n");
+		pr_info("nvsvc: koi hook nahi, abort\n");
 		return -EIO;
 	}
 #endif
