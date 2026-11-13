@@ -1,11 +1,11 @@
 // ============================================================
-//  DARKxKERNEL KPM  (wanbai)  v21
-//  v21:
-//   - /data/adb aur manager data dirs ab REWRITE nahi hote,
-//     sirf listing me hide -> APatch package_config/settings safe
-//   - mgr uid detection multi-path + fail par loud warning
-//   - OP_STATE debug ioctl
-//   - baaki v20 jaisa (wanbai node, /dev announce, crash fixes)
+//  DARKxKERNEL KPM  (wanbai)  v24  — FINAL
+//  Client (DarkXKernal) me ZERO change. ABI byte-exact:
+//    node "wanbai" · OP_INIT_KEY 0x800 -> 0
+//    OP_READ_MEM 0x801 · OP_WRITE_MEM 0x802 · OP_MODULE_BASE 0x803
+//    OP_HIDE_PROCESS 0x804
+//  Sab automatic: game uid, zygisk, /data/adb, /data/local/tmp,
+//  .system_*, apne artefacts, dmesg, TracerPid.
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -56,7 +56,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("21.0.0");
+KPM_VERSION("24.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -78,6 +78,12 @@ KPM_DESCRIPTION("system service");
 #endif
 #ifndef E2BIG
 #define E2BIG 7
+#endif
+#ifndef ENODEV
+#define ENODEV 19
+#endif
+#ifndef EBUSY
+#define EBUSY 16
 #endif
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -136,6 +142,7 @@ struct pid;
 struct task_struct;
 struct anon_vma;
 struct vm_operations_struct;
+struct input_dev;
 
 struct kp_qstr { unsigned int hash; unsigned int len; const unsigned char *name; };
 struct kp_hlist_bl_node { struct kp_hlist_bl_node *next, **pprev; };
@@ -186,27 +193,10 @@ struct kp_miscdevice {
 
 struct kp_seq_file { char *buf; size_t size; size_t from; size_t count; };
 struct kp_statfs { long f_type; long f_bsize; };
-struct kp_mm;
 
-struct kp_vma {
-	unsigned long vm_start;
-	unsigned long vm_end;
-	struct kp_vma *vm_next;
-	struct kp_vma *vm_prev;
-	void *vm_rb[3];
-	unsigned long rb_subtree_gap;
-	struct kp_mm *vm_mm;
-	unsigned long vm_page_prot;
-	unsigned long vm_flags;
-	void *vm_shared[4];
-	struct list_head anon_vma_chain;
-	struct anon_vma *anon_vma;
-	const struct vm_operations_struct *vm_ops;
-	unsigned long vm_pgoff;
-	struct kp_file *vm_file;
-};
-
-struct kp_mm { struct kp_vma *mmap; };
+/* mm_struct->mmap offset 0 (<=6.0). vma: vm_start 0, vm_end 8,
+ * vm_next 0x10, vm_mm 0x40 (<=6.0) / 0x10 (>=6.1). */
+struct kp_mm { void *head; };
 
 #define __NEW_UTS_LEN 64
 struct kp_utsname {
@@ -242,6 +232,7 @@ static int  (*k_in_compat)(void);
 static int  *k_kptr_restrict;
 static char **k_saved_cmdline;
 static struct kp_utsns *k_uts;
+static void *(*k_find_vma)(void *, unsigned long);
 
 #define copy_from_user(to, from, n) \
 	(k_copy_from_user ? k_copy_from_user((to), (from), (unsigned long)(n)) : -EFAULT)
@@ -484,9 +475,17 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_VFS     0x80E
 #define OP_PING    0x80F
 #define OP_STATE   0x810
-#define API_VER    13
-#define MAX_IO     0x2000000
+#define OP_TOUCH   0x811
+#define OP_TRANGE  0x812
+#define OP_HIDEN   0x813
+#define OP_DMESG   0x814
+#define OP_TOUCHQ  0x816
+#define OP_TREL    0x819
+#define OP_KPTR    0x81A
+#define API_VER    16
 #define SMALL_IO   512
+#define KMEM_CHUNK 1024
+#define KMEM_MAX   0x1000000
 #define PATH_S     48
 #define FAKE_DIR   "/data/misc/.__np"
 #define FAKE_FALL  "/data/misc"
@@ -494,6 +493,7 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OVERLAY_MAGIC 0x794c7630U
 #define EXT4_MAGIC    0xef53U
 
+/* client ke struct layout ke saath byte-exact */
 struct copy_mem { int pid; unsigned int pad; unsigned long long addr, buffer, size; };
 struct mod_base { int pid; unsigned int pad; unsigned long long name, base; };
 struct copy_mem32 { int pid; unsigned int addr, buffer, size; };
@@ -506,23 +506,21 @@ static int  kptr_saved;
 static int  dev_ok;
 static int  inited;
 static int  uts_ok;
-static int  strict;          /* 0 = root bypass (default), 1 = strict, 2 = off */
+static int  strict;
 static int  hide_pid;
 static int  mgr_uid = -1;
 static int  game_uid = -1;
-static int  game_byp;        /* default 0: game ko bhi poora hide */
+static int  game_byp;
 static int  hooks_off;
-static int  vfs_on;          /* vfs_read hook default off */
+static int  vfs_on;
 static int  abi_force = -1;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
 static unsigned long iterate_addr, piddir_addr;
 static char *cmd_end;
 
-/* per-category recursion guards */
 static int g_name, g_read, g_seq, g_dir;
 
-/* root + manager bypass (game sirf tab jab game_byp on ho) */
 static int bypass(void)
 {
 	unsigned int u;
@@ -534,11 +532,7 @@ static int bypass(void)
 }
 
 /* ============================================================
- *  REWRITE LIST  (open sach me fail hona chahiye)
- *  Yahan sirf wahi cheezein hain jo root binaries/config hain.
- *  /data/adb, manager data dirs, /data/local/tmp => sirf listing
- *  me hide (blk_name), open chalta rahe. Isse APatch ka
- *  package_config / settings kabhi tootta nahi.
+ *  REWRITE LIST
  * ============================================================ */
 static const char *const hidden[] = {
 	"/sbin/su", "/system/bin/su", "/system/xbin/su",
@@ -553,18 +547,19 @@ static const char *const hidden[] = {
 };
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
-/* listing se hide hone wale naam (sab jagah) */
 static const char *const blk_name[] = {
 	"su", "magisk", "Magisk", "magiskd", "ksud", "apd", "adb", "kpatch",
 	"kpatchd", "kp", "wanbai", ".__np", ".magisk", ".ext", "debug_ramdisk",
 	"libnvsvc.so", "init.magisk.rc", "init.kpatch.rc", "config.gz",
 	"zygisk", "zygiskd", "libzygisk.so", "libzygiskd.so", "tmp",
+	"android.system.svc", "system_log_svc", "STEMMERX.sh",
 };
 #define BLK_N ARRAY_SIZE(blk_name)
 
 static const char *const blk_pfx[] = {
 	"com.topjohnwu.magisk", "me.weishu.kernelsu",
 	"me.bmax.apatch", "com.dergoogler.mmrl",
+	".system_",
 };
 #define BLK_PF ARRAY_SIZE(blk_pfx)
 
@@ -573,14 +568,56 @@ static const char *const blk_text[] = {
 	"overlay", "wanbai", ".__np", "debug_ramdisk", "libnvsvc",
 	"/data/adb", "/data/local/tmp", "zygisk", "Zygisk",
 	"com.topjohnwu.magisk", "me.weishu.kernelsu", "me.bmax.apatch",
+	"android.system.svc", "STEMMERX",
 };
 #define BLK_T ARRAY_SIZE(blk_text)
 
 static const char *const blk_maps[] = {
 	"overlay", "/data/adb", "wanbai", "libnvsvc", "debug_ramdisk",
-	"/data/local/tmp", "zygisk", ".__np",
+	"/data/local/tmp", "zygisk", ".__np", "android.system.svc",
 };
 #define BLK_M ARRAY_SIZE(blk_maps)
+
+/* ---------- pid set hide ---------- */
+#define HIDE_MAX 8
+static int hide_set[HIDE_MAX];
+static int hide_set_n;
+
+static int pid_in_set(int v)
+{
+	int i;
+	if (v <= 0) return 0;
+	for (i = 0; i < hide_set_n; i++)
+		if (hide_set[i] == v) return 1;
+	return 0;
+}
+
+static int proc_pid_hidden(const char *p)
+{
+	const char *q;
+	int v = 0, i = 0;
+
+	if (!p || p[0] != '/' || p[1] != 'p') return 0;
+	if (strncmp(p, "/proc/", 6)) return 0;
+	q = p + 6;
+	while (q[i] >= '0' && q[i] <= '9') {
+		v = v * 10 + (q[i] - '0');
+		if (++i > 7) return 0;
+	}
+	if (!i || (q[i] && q[i] != '/')) return 0;
+	return pid_in_set(v);
+}
+
+static void scrub_tracer(char *b, long n)
+{
+	char *p = kp_memmem(b, n, "TracerPid:", 10);
+	if (!p) return;
+	p += 10;
+	while (p < b + n && (*p == '\t' || *p == ' ')) p++;
+	if (p >= b + n || *p < '0' || *p > '9') return;
+	*p++ = '0';
+	while (p < b + n && *p >= '0' && *p <= '9') *p++ = ' ';
+}
 
 static int is_hidden(const char *p)
 {
@@ -589,6 +626,7 @@ static int is_hidden(const char *p)
 	long n;
 
 	if (!p || p[0] != '/') return 0;
+	if (proc_pid_hidden(p)) return 1;
 	switch (p[1]) {
 	case 'd': case 's': case 'v': case 'c': case 'p':
 		break;
@@ -650,7 +688,168 @@ static void blank_word(char *b, const char *w)
 	while ((p = strstr(p, w))) { memset(p, ' ', n); p += n; }
 }
 
-/* ---------- kernel version ---------- */
+/* ============================================================
+ *  dmesg filter — sabse pehle install, apni lines drop
+ * ============================================================ */
+#define KM_MAX 1024
+static struct kretprobe kr_kmsg;
+static int dmesg_hide = 1;
+
+static int kmsg_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	int *on = (int *)ri->data;
+	(void)regs;
+	*on = (dmesg_hide && !bypass()) ? 1 : 0;
+	return *on;
+}
+
+static int kmsg_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	char __user *ub = (char __user *)P_ARG1(regs);
+	long ret = (long)regs_return_value(regs);
+	char buf[KM_MAX], out[KM_MAX];
+	long n, i, o = 0, line;
+
+	if (!*(int *)ri->data || ret <= 0 || !user_ok((unsigned long)ub)) return 0;
+	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
+	if (copy_from_user(buf, ub, n)) return 0;
+	buf[n] = '\0';
+
+	for (i = 0; i < n; i = line) {
+		char *nl = memchr(buf + i, '\n', n - i);
+		line = nl ? (long)(nl - buf) + 1 : n;
+		if (kp_memmem(buf + i, line - i, "wanbai", 6)) continue;
+		if (o + (line - i) > (long)sizeof(out)) break;
+		memcpy(out + o, buf + i, line - i);
+		o += line - i;
+	}
+	if (!o) { P_RET(regs) = 0; return 0; }
+	if (copy_to_user(ub, out, o)) return 0;
+	P_RET(regs) = o;
+	return 0;
+}
+
+/* ============================================================
+ *  touch (bonus — client khud inject karta hai)
+ * ============================================================ */
+#define INJ_KEY 0x4B504D31u
+#define ABS_MT_POSITION_X 0x35
+#define ABS_MT_POSITION_Y 0x36
+#define ABS_X 0x00
+#define ABS_Y 0x01
+#define BTN_TOUCH 0x14a
+#define EV_KEY 0x01
+#define EV_ABS 0x03
+#define MT_TOOL_FINGER 0
+#define ABSINFO_SZ 24
+
+static struct input_dev *inj_dev;
+static int inj_ok;
+static int inj_on = 1;
+static int inj_down;
+static unsigned int inj_mx, inj_my;
+static void *inj_addr;
+
+static int  (*k_input_event)(struct input_dev *, unsigned int, unsigned int, int);
+static int  (*k_input_mt_slot)(struct input_dev *, int);
+static void (*k_input_mt_report_slot_state)(struct input_dev *, unsigned int, bool);
+static int  (*k_input_mt_get_slot_by_key)(struct input_dev *, int);
+static void (*k_input_sync)(struct input_dev *);
+
+static int inj_alive(void)
+{
+	const char *n;
+	if (!inj_ok || !kptr_ok(inj_dev)) return 0;
+	n = *(const char **)inj_dev;
+	if (!kptr_ok(n)) return 0;
+	return n[0] >= 0x20 && n[0] <= 0x7e;
+}
+
+/* input_dev->absinfo pointer ka offset probe (layout par bharosa nahi) */
+static int inj_range_probe(void)
+{
+	unsigned int off;
+	int *ai, mx, my;
+
+	if (!inj_alive()) return 0;
+	for (off = 0xe0; off <= 0x140; off += 8) {
+		ai = *(int **)((char *)inj_dev + off);
+		if (!kptr_ok(ai)) continue;
+		mx = *(int *)((char *)ai + ABS_MT_POSITION_X * ABSINFO_SZ + 8);
+		my = *(int *)((char *)ai + ABS_MT_POSITION_Y * ABSINFO_SZ + 8);
+		if (mx > 0 && mx < 100000 && my > 0 && my < 100000) {
+			inj_mx = (unsigned int)mx;
+			inj_my = (unsigned int)my;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void learn_before(hook_fargs4_t *f, void *ud)
+{
+	struct input_dev *d = (struct input_dev *)f->arg0;
+	(void)ud;
+	if (inj_ok || !kptr_ok(d)) return;
+	if ((int)f->arg1 != EV_ABS) return;
+	inj_dev = d;
+	inj_ok = 1;
+}
+
+static void learn_after(hook_fargs4_t *f, void *ud) { (void)f; (void)ud; }
+
+static int learner_install(void)
+{
+	unsigned long a;
+	if (inj_addr) return 0;
+	if (!kallsyms_lookup_name) return -ESRCH;
+	a = kallsyms_lookup_name("input_event");
+	if (!a) return -ESRCH;
+	if (hook_wrap4((void *)a, learn_before, learn_after, 0)) return -EIO;
+	inj_addr = (void *)a;
+	hooks_ok++;
+	return 0;
+}
+
+static void learner_remove(void)
+{
+	if (!inj_addr) return;
+	hook_unwrap(inj_addr, learn_before, learn_after);
+	inj_addr = 0;
+	if (hooks_ok) hooks_ok--;
+}
+
+static void inject_touch(unsigned int x, unsigned int y, int down)
+{
+	struct input_dev *d = inj_dev;
+	int slot;
+
+	if (!inj_alive() || !inj_on || !k_input_event) return;
+	if (!inj_mx || !inj_my) inj_range_probe();
+	if (inj_mx && x > inj_mx) x = inj_mx;
+	if (inj_my && y > inj_my) y = inj_my;
+
+	if (k_input_mt_slot && k_input_mt_report_slot_state && k_input_mt_get_slot_by_key) {
+		slot = k_input_mt_get_slot_by_key(d, (int)INJ_KEY);
+		if (slot < 0) slot = 0;
+		k_input_mt_slot(d, slot);
+		k_input_mt_report_slot_state(d, MT_TOOL_FINGER, down ? true : false);
+		if (down) {
+			k_input_event(d, EV_ABS, ABS_MT_POSITION_X, (int)x);
+			k_input_event(d, EV_ABS, ABS_MT_POSITION_Y, (int)y);
+		}
+	} else {
+		k_input_event(d, EV_ABS, ABS_X, (int)x);
+		k_input_event(d, EV_ABS, ABS_Y, (int)y);
+		k_input_event(d, EV_KEY, BTN_TOUCH, down);
+	}
+	if (k_input_sync) k_input_sync(d);
+	inj_down = down;
+}
+
+/* ============================================================
+ *  kernel version
+ * ============================================================ */
 static int kver_mm(unsigned int *maj, unsigned int *min)
 {
 	const char *p;
@@ -728,7 +927,6 @@ static void uts_scrub(void)
 	c = v + strlen(v);
 	while (c > v && c[-1] == ' ') *--c = '\0';
 
-	/* APatch Full/LKM mode isi token se decide karta hai */
 	if (!strstr(v, "kpatch")) {
 		l = (long)strlen(v);
 		if (l + 8 < (long)sizeof(k_uts->name.version))
@@ -765,16 +963,18 @@ static const char *const game_path[] = {
 	"/data/data/com.dts.freefiremax",
 };
 
-/* inode->i_uid offset 4 (i_mode u16, i_opflags u16, kuid_t i_uid) */
 static unsigned int inode_uid(const char *path)
 {
 	struct kp_path p;
-	unsigned int uid = 0;
+	unsigned int uid = 0, mode;
 
 	if (!k_kern_path || !k_path_put) return 0;
+	memset(&p, 0, sizeof(p));
 	if (k_kern_path(path, LOOKUP_FOLLOW, &p)) return 0;
-	if (kptr_ok(p.dentry) && kptr_ok(p.dentry->d_inode))
-		uid = *(unsigned int *)((char *)p.dentry->d_inode + 4);
+	if (!kptr_ok(p.dentry) || !kptr_ok(p.dentry->d_inode)) { k_path_put(&p); return 0; }
+	mode = *(unsigned int *)p.dentry->d_inode;
+	if ((mode & 0xF000) != 0x4000 && (mode & 0xF000) != 0x8000) { k_path_put(&p); return 0; }
+	uid = *(unsigned int *)((char *)p.dentry->d_inode + 4);
 	k_path_put(&p);
 	return (uid > 0 && uid < 20000) ? uid : 0;
 }
@@ -792,7 +992,7 @@ static void detect_uids(void)
 		if (u) game_uid = (int)u;
 	}
 	if (mgr_uid > 0) pr_info("wanbai: mgr uid %d\n", mgr_uid);
-	else pr_info("wanbai: WARN mgr uid DETECT FAIL (settings break ho sakti hain)\n");
+	else pr_info("wanbai: WARN mgr uid DETECT FAIL\n");
 	if (game_uid > 0) pr_info("wanbai: game uid %d\n", game_uid);
 }
 
@@ -1029,7 +1229,7 @@ static bool filter_actor_pid(struct kp_dir_context *c, const char *name, int nam
 	c->pos = off;
 	for (i = 0; i < namlen && name[i] >= '0' && name[i] <= '9'; i++)
 		v = v * 10 + (name[i] - '0');
-	if (i && i == namlen && v == hide_pid) { o->pos = off; return false; }
+	if (i && i == namlen && (v == hide_pid || pid_in_set(v))) { o->pos = off; return false; }
 	if (name_blocked(name, namlen)) { o->pos = off; return false; }
 	o->pos = off;
 	r = o->actor(o, name, namlen, off, ino, type);
@@ -1053,7 +1253,7 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	if (bypass()) {
 		dev = is_dev_dir(f->arg0);
 		if (!dev) return;
-	} else if (pidonly && !hide_pid) {
+	} else if (pidonly && !hide_pid && !hide_set_n) {
 		return;
 	}
 
@@ -1080,6 +1280,16 @@ static void dir_after(hook_fargs4_t *f, void *ud)
 /* ---------- read scrub ---------- */
 static struct kretprobe kr_pread, kr_bprop;
 
+static int pid_parent(struct kp_file *f)
+{
+	const char *pn;
+	if (!kptr_ok(f) || !kptr_ok(f->f_path.dentry)) return 0;
+	if (!kptr_ok(f->f_path.dentry->d_parent)) return 0;
+	pn = f->f_path.dentry->d_parent->d_name.name;
+	if (!kptr_ok(pn)) return 0;
+	return pn[0] >= '0' && pn[0] <= '9';
+}
+
 static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct kp_file *f = (struct kp_file *)P_ARG0(regs);
@@ -1092,19 +1302,16 @@ static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (bypass() || !kptr_ok(f) || !kptr_ok(f->f_path.dentry)) return 0;
 
 	len = f->f_path.dentry->d_name.len;
-	if (len != 7 && len != 8 && len != 10) return 0;
+	if (len != 7 && len != 8 && len != 10 && len != 6) return 0;
 
 	n = f->f_path.dentry->d_name.name;
 	if (!kptr_ok(n)) return 0;
-	if (len == 7 && !strcmp(n, "cmdline")) { *mode = 1; return 1; }
+	if (len == 7 && !strcmp(n, "cmdline") && pid_parent(f)) { *mode = 1; return 1; }
 	if (len == 8 && !strncmp(n, "bootargs", 8)) { *mode = 1; return 1; }
 	if (len == 10 && !strcmp(n, "build.prop")) { *mode = 2; return 1; }
 	if (len == 7 && !strcmp(n, "enforce")) { *mode = 4; return 1; }
-	if (len == 7 && !strcmp(n, "current")) {
-		const char *pn = kptr_ok(f->f_path.dentry->d_parent) ?
-			f->f_path.dentry->d_parent->d_name.name : NULL;
-		if (kptr_ok(pn) && !strcmp(pn, "attr")) { *mode = 3; return 1; }
-	}
+	if (len == 6 && !strcmp(n, "status") && pid_parent(f)) { *mode = 5; return 1; }
+	if (len == 7 && !strcmp(n, "current") && pid_parent(f)) { *mode = 3; return 1; }
 	return 0;
 }
 
@@ -1126,6 +1333,7 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	case 2: scrub_buildprop(buf); break;
 	case 3: scrub_ctx(buf); break;
 	case 4: if (buf[0] == '0') buf[0] = '1'; break;
+	case 5: scrub_tracer(buf, n); break;
 	default: break;
 	}
 	copy_to_user(ub, buf, n);
@@ -1197,7 +1405,7 @@ static int tr_entry_kind(struct kretprobe_instance *ri, struct pt_regs *regs, in
 	if (g_seq) return 0;
 	if (bypass() || !kptr_ok(m) || !kptr_ok(m->buf)) return 0;
 	if (m->size < 64 || m->size > 0x100000) return 0;
-	if (m->count > m->size) return 0;
+	if (m->count > m->size || m->from) return 0;
 	g_seq = 1;
 	d->saved = (long)m->count;
 	d->ok = 1;
@@ -1397,6 +1605,7 @@ static void pick_fake_path(void)
 {
 	struct kp_path p;
 	if (!k_kern_path || !k_path_put) return;
+	memset(&p, 0, sizeof(p));
 	if (!k_kern_path(FAKE_DIR, LOOKUP_DIRECTORY | LOOKUP_FOLLOW, &p)) {
 		k_path_put(&p);
 		fake_path = FAKE_DIR;
@@ -1436,11 +1645,16 @@ static int resolve_syms(void)
 	RS("access_process_vm", k_access_process_vm);
 	RS("no_llseek", k_no_llseek);
 	RS("flush_icache_range", k_flush_icache);
+	RS("find_vma", k_find_vma);
+	RS("input_event", k_input_event);
+	RS("input_mt_slot", k_input_mt_slot);
+	RS("input_mt_report_slot_state", k_input_mt_report_slot_state);
+	RS("input_mt_get_slot_by_key", k_input_mt_get_slot_by_key);
+	RS("input_sync", k_input_sync);
 	if (!k_copy_from_user) return -ESRCH;
 	return 0;
 }
 
-/* ---------- ioctl ---------- */
 static struct task_struct *task_get(int pid)
 {
 	struct task_struct *t;
@@ -1452,6 +1666,51 @@ static struct task_struct *task_get(int pid)
 
 static void task_put(struct task_struct *t) { if (t && k_put_task_struct) k_put_task_struct(t); }
 
+/* ============================================================
+ *  chunked r/w
+ * ============================================================ */
+static char *kmem_buf;
+static char kmem_busy;
+
+static long kmem_rw(int pid, unsigned long addr, unsigned long ua,
+		    unsigned long len, int wr)
+{
+	struct task_struct *t;
+	long done = 0, r = 0;
+
+	if (!kmem_buf || !len || len > KMEM_MAX) return -EINVAL;
+	if (!user_ok(addr) || !user_ok(ua)) return -EINVAL;
+	if (!k_access_process_vm) return -EIO;
+
+	if (__atomic_test_and_set(&kmem_busy, __ATOMIC_ACQ_REL)) return -EBUSY;
+
+	t = task_get(pid);
+	if (!t) { __atomic_clear(&kmem_busy, __ATOMIC_RELEASE); return -ESRCH; }
+
+	while (done < (long)len) {
+		unsigned long n = len - done;
+		if (n > KMEM_CHUNK) n = KMEM_CHUNK;
+
+		if (wr) {
+			if (copy_from_user(kmem_buf, (void __user *)(ua + done), n)) { r = -EFAULT; break; }
+			r = k_access_process_vm(t, addr + done, kmem_buf, (int)n, FOLL_WRITE | FOLL_FORCE);
+		} else {
+			r = k_access_process_vm(t, addr + done, kmem_buf, (int)n, 0);
+			if (r > 0 && copy_to_user((void __user *)(ua + done), kmem_buf, r)) { r = -EFAULT; break; }
+		}
+		if (r <= 0) break;
+		done += r;
+		if (r < (long)n) break;
+	}
+	task_put(t);
+	__atomic_clear(&kmem_busy, __ATOMIC_RELEASE);
+
+	if (wr && done > 0 && k_flush_icache)
+		k_flush_icache(addr, addr + (unsigned long)done);
+	return done > 0 ? done : (r < 0 ? r : -EIO);
+}
+
+/* ---------- ioctl ---------- */
 static void wb_size(unsigned long arg, int c32, unsigned long long sz)
 {
 	if (c32) {
@@ -1469,11 +1728,27 @@ static void wb_size(unsigned long arg, int c32, unsigned long long sz)
 	}
 }
 
+/* vm_file offset probe — layout par bharosa nahi, validate karte hain */
+static const int vm_file_off[] = { 0xa8, 0xb0, 0xa0, 0xb8, 0x98 };
+
+static struct kp_file *vma_file(void *v)
+{
+	unsigned int i;
+	struct kp_file *f;
+	for (i = 0; i < ARRAY_SIZE(vm_file_off); i++) {
+		f = *(struct kp_file **)((char *)v + vm_file_off[i]);
+		if (!kptr_ok(f)) continue;
+		if (!kptr_ok(f->f_path.dentry)) continue;
+		if (!kptr_ok(f->f_path.dentry->d_name.name)) continue;
+		return f;
+	}
+	return 0;
+}
+
 static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 {
 	struct copy_mem cm;
 	struct task_struct *tsk;
-	void *kbuf;
 	char small[SMALL_IO];
 	int ret, c32 = 0;
 	(void)f;
@@ -1481,6 +1756,7 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	c32 = abi_force >= 0 ? abi_force : (k_in_compat ? (k_in_compat() ? 1 : 0) : 0);
 	memset(&cm, 0, sizeof(cm));
 
+	/* client compat: init_key() ko hamesha 0 */
 	if (cmd == OP_INIT) return 0;
 	if (!user_ok(arg)) return 0;
 
@@ -1497,7 +1773,8 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		v[0] = mgr_uid;
 		v[1] = game_uid;
 		v[2] = (int)hooks_ok;
-		v[3] = (strict << 8) | (game_byp << 4) | (vfs_on ? 2 : 0) | (dev_ok ? 1 : 0);
+		v[3] = (strict << 8) | (game_byp << 4) | (vfs_on ? 2 : 0) | (dev_ok ? 1 : 0)
+			| (kptr_saved ? 4 : 0);
 		return copy_to_user((void __user *)arg, v, sizeof(v)) ? -EFAULT : 0;
 	}
 	if (cmd == OP_STRICT) {
@@ -1510,6 +1787,65 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
 		hide_pid = v;
+		return 0;
+	}
+	if (cmd == OP_HIDEN) {
+		int v[HIDE_MAX + 1];
+		int i;
+		if (copy_from_user(v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		if (v[HIDE_MAX] < 0 || v[HIDE_MAX] > HIDE_MAX) return -EINVAL;
+		hide_set_n = 0;
+		for (i = 0; i < v[HIDE_MAX]; i++)
+			if (v[i] > 0 && hide_set_n < HIDE_MAX) hide_set[hide_set_n++] = v[i];
+		return 0;
+	}
+	if (cmd == OP_KPTR) {
+		unsigned int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		if (v && !kptr_saved && kptr_ok(k_kptr_restrict)) {
+			saved_kptr = *k_kptr_restrict;
+			kptr_saved = 1;
+			*k_kptr_restrict = 1;
+		} else if (!v && kptr_saved && kptr_ok(k_kptr_restrict)) {
+			*k_kptr_restrict = saved_kptr;
+			kptr_saved = 0;
+		}
+		return 0;
+	}
+	if (cmd == OP_TOUCH) {
+		unsigned int v[3];
+		if (!inj_alive()) return -ENODEV;
+		if (copy_from_user(v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		if (v[2] == 1) inject_touch(v[0], v[1], 1);
+		else if (v[2] == 0) inject_touch(v[0], v[1], 0);
+		else if (inj_down) inject_touch(v[0], v[1], 1);
+		return 0;
+	}
+	if (cmd == OP_TRANGE) {
+		unsigned int v[2];
+		if (copy_from_user(v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		if (!v[0] || !v[1]) return -EINVAL;
+		inj_mx = v[0]; inj_my = v[1];
+		return 0;
+	}
+	if (cmd == OP_TOUCHQ) {
+		unsigned int v[3];
+		v[0] = inj_alive() ? 1u : 0u;
+		if (!inj_mx || !inj_my) inj_range_probe();
+		v[1] = inj_mx; v[2] = inj_my;
+		return copy_to_user((void __user *)arg, v, sizeof(v)) ? -EFAULT : 0;
+	}
+	if (cmd == OP_TREL) {
+		inj_ok = 0;
+		inj_dev = 0;
+		inj_mx = 0; inj_my = 0;
+		learner_remove();
+		return learner_install();
+	}
+	if (cmd == OP_DMESG) {
+		unsigned int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		dmesg_hide = !!v;
 		return 0;
 	}
 	if (cmd == OP_MUID) {
@@ -1540,8 +1876,16 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	if (cmd == OP_OFF) {
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
-		if (v && !hooks_off) { hooks_remove(); hooks_off = 1; }
-		else if (!v && hooks_off) { hooks_off = 0; hooks_install(); }
+		if (v && !hooks_off) {
+			hooks_remove();
+			learner_remove();
+			hooks_ok = 0;
+			hooks_off = 1;
+		} else if (!v && hooks_off) {
+			hooks_off = 0;
+			hooks_install();
+			learner_install();
+		}
 		return 0;
 	}
 	if (cmd == OP_ABI) {
@@ -1574,7 +1918,7 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	if (cmd == OP_BASE) {
 		struct mod_base mb;
 		struct kp_mm *mm;
-		struct kp_vma *vma;
+		void *vma;
 		char pname[256];
 		unsigned long long found = 0;
 		int guard = 0;
@@ -1598,16 +1942,24 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		task_put(tsk);
 		if (!mm) return -ESRCH;
 
-		vma = mm->mmap;
+		/* >=6.1: mm->mmap field nahi hai (maple tree) -> find_vma */
+		if (k_find_vma) vma = k_find_vma(mm, 0);
+		else vma = *(void **)mm;
+
 		while (kptr_ok(vma) && guard++ < 8192) {
-			const char *dn;
-			if (vma->vm_mm != mm) break;
-			if (kptr_ok(vma->vm_file) && kptr_ok(vma->vm_file->f_path.dentry)) {
-				dn = vma->vm_file->f_path.dentry->d_name.name;
-				if (kptr_ok(dn) && strstr(dn, pname)) { found = vma->vm_start; break; }
+			struct kp_file *vf;
+			unsigned long vstart = *(unsigned long *)vma;
+			unsigned long vend = *(unsigned long *)((char *)vma + 8);
+
+			if (!vend || vend <= vstart) break;
+
+			vf = vma_file(vma);
+			if (vf) {
+				const char *dn = vf->f_path.dentry->d_name.name;
+				if (kptr_ok(dn) && strstr(dn, pname)) { found = vstart; break; }
 			}
-			if (!kptr_ok(vma->vm_next) || vma->vm_next <= vma) break;
-			vma = vma->vm_next;
+			if (k_find_vma) vma = k_find_vma(mm, vend);
+			else vma = *(void **)((char *)vma + 0x10);   /* vm_next (<=6.0) */
 		}
 		if (k_mmput) k_mmput(mm);
 		mb.base = found;
@@ -1620,39 +1972,41 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		return 0;
 	}
 
-	if (!cm.pid || !cm.size || cm.size > MAX_IO) return -EINVAL;
+	if (!cm.pid || !cm.size) return -EINVAL;
+	if (cm.size > KMEM_MAX) return -EINVAL;
 	if (!user_ok((unsigned long)cm.addr) || !user_ok((unsigned long)cm.buffer)) return -EINVAL;
-	tsk = task_get(cm.pid);
-	if (!tsk) return -ESRCH;
-	if (!k_access_process_vm) { task_put(tsk); return -EIO; }
 
-	if (cm.size <= SMALL_IO) kbuf = small;
-	else {
-		if (!k_kvmalloc) { task_put(tsk); return -ENOMEM; }
-		kbuf = k_kvmalloc((unsigned long)cm.size, GFP_KERNEL);
-		if (!kbuf) { task_put(tsk); return -ENOMEM; }
+	if (cmd == OP_READ || cmd == OP_WRITE) {
+		if (cm.size > SMALL_IO) {
+			ret = (int)kmem_rw(cm.pid, (unsigned long)cm.addr, (unsigned long)cm.buffer,
+					   (unsigned long)cm.size, cmd == OP_WRITE);
+			if (ret > 0) { wb_size(arg, c32, (unsigned long long)ret); return 0; }
+			return ret;
+		}
+		tsk = task_get(cm.pid);
+		if (!tsk) return -ESRCH;
+		if (!k_access_process_vm) { task_put(tsk); return -EIO; }
+		if (cmd == OP_READ) {
+			ret = k_access_process_vm(tsk, (unsigned long)cm.addr, small, (int)cm.size, 0);
+			if (ret > 0 && copy_to_user((void __user *)(unsigned long)cm.buffer, small, ret))
+				ret = -EFAULT;
+		} else {
+			if (copy_from_user(small, (void __user *)(unsigned long)cm.buffer,
+					   (unsigned long)cm.size)) ret = -EFAULT;
+			else {
+				ret = k_access_process_vm(tsk, (unsigned long)cm.addr, small,
+							  (int)cm.size, FOLL_WRITE | FOLL_FORCE);
+				if (ret > 0 && k_flush_icache)
+					k_flush_icache((unsigned long)cm.addr,
+						       (unsigned long)cm.addr + (unsigned long)ret);
+			}
+		}
+		task_put(tsk);
+		if (ret > 0) { wb_size(arg, c32, (unsigned long long)ret); return 0; }
+		return ret < 0 ? ret : -EIO;
 	}
 
-	if (cmd == OP_READ) {
-		ret = k_access_process_vm(tsk, (unsigned long)cm.addr, kbuf, (int)cm.size, 0);
-		if (ret > 0 && copy_to_user((void __user *)(unsigned long)cm.buffer, kbuf, ret))
-			ret = -EFAULT;
-	} else if (cmd == OP_WRITE) {
-		if (copy_from_user(kbuf, (void __user *)(unsigned long)cm.buffer,
-				   (unsigned long)cm.size)) ret = -EFAULT;
-		else {
-			ret = k_access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
-						  (int)cm.size, FOLL_WRITE | FOLL_FORCE);
-			if (ret > 0 && k_flush_icache)
-				k_flush_icache((unsigned long)cm.addr,
-					       (unsigned long)cm.addr + (unsigned long)ret);
-		}
-	} else ret = -EINVAL;
-
-	if (kbuf != (void *)small && k_kvfree) k_kvfree(kbuf);
-	task_put(tsk);
-	if (ret > 0) { wb_size(arg, c32, (unsigned long long)ret); return 0; }
-	return ret < 0 ? ret : -EIO;
+	return -EINVAL;
 }
 
 static loff_t dev_noop_llseek(struct kp_file *f, loff_t o, int w)
@@ -1684,27 +2038,41 @@ KPM_CTL0(owner_ctl);
 static long nvsvc_start(const char *args, const char *event, void *__user reserved)
 {
 	unsigned int maj = 0, min = 0;
+	unsigned int base_hooks;
 	int r;
+
 	(void)args; (void)event; (void)reserved;
 
 	if (!name_decode()) {
 		pr_info("wanbai: owner tag tampered\n");
 		return -EIO;
 	}
-	pr_info("wanbai: %s (stage %d, strict %d)\n", owner_name, STAGE, strict);
+
+	/* 1. dmesg filter sabse pehle */
+	kr_kmsg.kp.symbol_name = "devkmsg_read";
+	kr_kmsg.data_size = sizeof(int);
+	kr_kmsg.entry_handler = kmsg_entry;
+	kr_kmsg.handler = kmsg_ret;
+	kr_kmsg.maxactive = 32;
+	if (!register_kretprobe(&kr_kmsg)) hooks_ok++;
+	else memset(&kr_kmsg, 0, sizeof(kr_kmsg));
 
 	r = resolve_syms();
-	if (r) { pr_info("wanbai: resolve %d\n", r); return r; }
+	if (r) goto err;
 
 	if (kver_mm(&maj, &min)) {
 		maj = 5; min = 10;
 		pr_info("wanbai: version unknown, assuming %u.%u\n", maj, min);
 	} else if (maj < 3 || (maj == 3 && min < 18)) {
 		pr_info("wanbai: kernel %u.%u bahut purana\n", maj, min);
-		return -EINVAL;
+		r = -EINVAL;
+		goto err;
 	}
 
 	fops_layout(maj, min);
+
+	if (k_kvmalloc) kmem_buf = k_kvmalloc(KMEM_CHUNK, GFP_KERNEL);
+	if (!kmem_buf) { r = -ENOMEM; goto err; }
 
 	memset(fops_buf, 0, sizeof(fops_buf));
 	fops_put(1 * sizeof(void *),
@@ -1727,7 +2095,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 
 	if (k_misc_register && k_misc_deregister) {
 		r = k_misc_register(&dev);
-		if (r) pr_info("wanbai: misc_register %d (node skip)\n", r);
+		if (r) { pr_info("wanbai: misc_register %d (node skip)\n", r); r = 0; }
 		else { dev_ok = 1; pr_info("wanbai: registered\n"); }
 	} else {
 		pr_info("wanbai: misc_register missing, node skip\n");
@@ -1736,22 +2104,33 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 #if STAGE >= 2
 	if (k_uts) uts_scrub();
 	cmdline_scrub();
-	if (kptr_ok(k_kptr_restrict) && *k_kptr_restrict < 1) {
-		saved_kptr = *k_kptr_restrict;
-		kptr_saved = 1;
-		*k_kptr_restrict = 1;
-	}
 #endif
+
+	base_hooks = hooks_ok;
 
 #if STAGE >= 3
 	hooks_install();
-	if (!hooks_ok)
-		pr_info("wanbai: WARN koi hook nahi laga, phir bhi loaded\n");
+	learner_install();
+	if (hooks_ok <= base_hooks) {
+		pr_info("wanbai: koi hook nahi laga\n");
+		r = -EIO;
+		goto err;
+	}
 #endif
 
 	inited = 1;
 	pr_info("wanbai: loaded, %u hooks (vfs %d, magic %04X)\n", hooks_ok, vfs_on, MAGIC);
 	return 0;
+
+err:
+	hooks_remove();
+	learner_remove();
+	if (dev_ok && k_misc_deregister) { k_misc_deregister(&dev); dev_ok = 0; }
+	uts_restore();
+	if (kmem_buf && k_kvfree) { k_kvfree(kmem_buf); kmem_buf = NULL; }
+	if (kr_kmsg.hooked) unregister_kretprobe(&kr_kmsg);
+	hooks_ok = 0;
+	return r;
 }
 
 static long nvsvc_stop(void *__user reserved)
@@ -1762,8 +2141,13 @@ static long nvsvc_stop(void *__user reserved)
 	hooks_off = 0;
 	g_name = g_read = g_seq = g_dir = 0;
 	hooks_remove();
-	if (kptr_saved && kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
+	learner_remove();
+	hooks_ok = 0;
+	if (kptr_saved && kptr_ok(k_kptr_restrict)) { *k_kptr_restrict = saved_kptr; kptr_saved = 0; }
 	uts_restore();
+	inj_ok = 0; inj_dev = 0; inj_down = 0; inj_mx = 0; inj_my = 0;
+	hide_set_n = 0;
+	if (kmem_buf && k_kvfree) { k_kvfree(kmem_buf); kmem_buf = NULL; }
 	if (dev_ok && k_misc_deregister) { k_misc_deregister(&dev); dev_ok = 0; }
 	return 0;
 }
