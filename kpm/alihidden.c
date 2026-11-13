@@ -1,10 +1,13 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v18  STABLE-HIDE
-//  v18:
-//   - vfs_read hook DEFAULT OFF (sabse hot path) -> OP_VFS se on
-//   - per-category recursion guard (name/read/seq/dir alag)
-//   - attr/current scrub ab valid context banata hai
-//   - kp ke extra paths bhi hidden
+//  DARKxKERNEL KPM  (wanbai)  v20
+//  v20:
+//   - node ka naam "wanbai" (client ki hardcoded list me hai)
+//   - /dev readdir me root ke liye entry khud emit hoti hai,
+//     order pe depend nahi -> galat device pakadna khatam
+//   - game ko node dikhta nahi
+//   - /data/local/tmp rewrite se hataya, sirf listing me hide
+//   - dir filter ctx->pos dono taraf sync
+//   - fops_layout clamp, dev.mode 0600
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -55,7 +58,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("17.0.0");
+KPM_VERSION("20.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -279,6 +282,17 @@ static void fops_layout(unsigned int maj, unsigned int min)
 	if (v >= 407) { poll_off = 9 * p;  uio_off = 10 * p; }
 	else          { poll_off = 7 * p;  uio_off = 8 * p; }
 	cio_off = uio_off + p;
+
+	if (uio_off + 2 * p > FOPS_MAX) {
+		poll_off = 9 * p;
+		uio_off = 10 * p;
+		cio_off = uio_off + p;
+	}
+	if (cio_off + p > FOPS_MAX) {
+		poll_off = 7 * p;
+		uio_off = 8 * p;
+		cio_off = uio_off + p;
+	}
 }
 
 /* ============================================================
@@ -394,7 +408,7 @@ static int register_kprobe(struct kprobe *p)
 	if (!p->symbol_name) return -EINVAL;
 	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(p->symbol_name);
-	if (!addr) { pr_info("nvsvc: no sym %s\n", p->symbol_name); return -ESRCH; }
+	if (!addr) { pr_info("wanbai: no sym %s\n", p->symbol_name); return -ESRCH; }
 	p->addr = (void *)addr;
 	if (hook_wrap4(p->addr, kprobe_before, kprobe_after, p)) { p->addr = 0; return -EIO; }
 	p->hooked = 1;
@@ -415,7 +429,7 @@ static int register_kretprobe(struct kretprobe *kr)
 	if (kr->data_size > KRET_BODY_MAX) return -E2BIG;
 	if (!kallsyms_lookup_name) return -ESRCH;
 	addr = kallsyms_lookup_name(kr->kp.symbol_name);
-	if (!addr) { pr_info("nvsvc: no sym %s\n", kr->kp.symbol_name); return -ESRCH; }
+	if (!addr) { pr_info("wanbai: no sym %s\n", kr->kp.symbol_name); return -ESRCH; }
 	kr->kp.addr = (void *)addr;
 	if (hook_wrap4(kr->kp.addr, kret_before, kret_after, kr)) { kr->kp.addr = 0; return -EIO; }
 	kr->hooked = 1;
@@ -452,7 +466,9 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 	return 0;
 }
 
-#define DEV_NAME   "nvsvc"
+#define DEV_NAME   "wanbai"
+#define DEV_LEN    ((int)sizeof(DEV_NAME) - 1)
+#define MAGIC      0x4E56
 #define OP_INIT    0x800
 #define OP_READ    0x801
 #define OP_WRITE   0x802
@@ -468,7 +484,8 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_OFF     0x80C
 #define OP_FLUSH   0x80D
 #define OP_VFS     0x80E
-#define API_VER    10
+#define OP_PING    0x80F
+#define API_VER    12
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -517,6 +534,8 @@ static int bypass(void)
 	return mgr_uid > 0 && (int)u == mgr_uid;
 }
 
+/* Sirf wahi paths jo "gayab" dikhne chahiye (open fail ho jaye).
+ * /data/local/tmp jaan bujh ke nahi: listing me hide, open chalta rahe. */
 static const char *const hidden[] = {
 	"/data/adb", "/sbin/su", "/system/bin/su", "/system/xbin/su",
 	"/vendor/bin/su", "/vendor/bin/kp", "/system/xbin/kp",
@@ -534,17 +553,17 @@ static const char *const hidden[] = {
 	"/data/data/me.bmax.apatch",
 	"/data/user/0/me.bmax.apatch",
 	"/data/user_de/0/me.bmax.apatch",
-	"/data/local/tmp", "/proc/config.gz", "/sys/module/nvsvc",
-	"/sys/class/misc/nvsvc", "/sys/module/kpatch",
+	"/proc/config.gz", "/sys/module/wanbai",
+	"/sys/class/misc/wanbai", "/sys/module/kpatch",
 	"/sys/module/kernelpatch", "/data/misc/.__np",
 };
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
 static const char *const blk_name[] = {
 	"su", "magisk", "Magisk", "magiskd", "ksud", "apd", "adb", "kpatch",
-	"kpatchd", "kp", "nvsvc", ".__np", ".magisk", ".ext", "debug_ramdisk",
+	"kpatchd", "kp", "wanbai", ".__np", ".magisk", ".ext", "debug_ramdisk",
 	"libnvsvc.so", "init.magisk.rc", "init.kpatch.rc", "config.gz",
-	"zygisk", "zygiskd", "libzygisk.so", "libzygiskd.so",
+	"zygisk", "zygiskd", "libzygisk.so", "libzygiskd.so", "tmp",
 };
 #define BLK_N ARRAY_SIZE(blk_name)
 
@@ -556,14 +575,14 @@ static const char *const blk_pfx[] = {
 
 static const char *const blk_text[] = {
 	"kpatch", "APatch", "KernelSU", "magisk", "Magisk", "ksud", "apd",
-	"overlay", "nvsvc", ".__np", "debug_ramdisk", "libnvsvc",
+	"overlay", "wanbai", ".__np", "debug_ramdisk", "libnvsvc",
 	"/data/adb", "/data/local/tmp", "zygisk", "Zygisk",
 	"com.topjohnwu.magisk", "me.weishu.kernelsu", "me.bmax.apatch",
 };
 #define BLK_T ARRAY_SIZE(blk_text)
 
 static const char *const blk_maps[] = {
-	"overlay", "/data/adb", "nvsvc", "libnvsvc", "debug_ramdisk",
+	"overlay", "/data/adb", "wanbai", "libnvsvc", "debug_ramdisk",
 	"/data/local/tmp", "zygisk", ".__np",
 };
 #define BLK_M ARRAY_SIZE(blk_maps)
@@ -598,8 +617,8 @@ static int name_blocked(const char *n, int len)
 
 	if (len <= 0 || len > 64) return 0;
 	switch (n[0]) {
-	case 's': case 'm': case 'M': case 'k': case 'a': case 'n':
-	case '.': case 'd': case 'l': case 'i': case 'c': case 'z':
+	case 's': case 'm': case 'M': case 'k': case 'a': case 'n': case 'w':
+	case '.': case 'd': case 'l': case 'i': case 'c': case 'z': case 't':
 		break;
 	default:
 		return 0;
@@ -693,7 +712,7 @@ static void uts_scrub(void)
 
 	if (uts_ok) return;
 	if (!uts_layout_ok()) {
-		pr_info("nvsvc: uts layout mismatch, skip\n");
+		pr_info("wanbai: uts layout mismatch, skip\n");
 		return;
 	}
 	r = k_uts->name.release;
@@ -771,8 +790,8 @@ static void detect_uids(void)
 		u = inode_uid(game_path[i]);
 		if (u) game_uid = (int)u;
 	}
-	if (mgr_uid > 0) pr_info("nvsvc: mgr uid %d\n", mgr_uid);
-	if (game_uid > 0) pr_info("nvsvc: game uid %d\n", game_uid);
+	if (mgr_uid > 0) pr_info("wanbai: mgr uid %d\n", mgr_uid);
+	if (game_uid > 0) pr_info("wanbai: game uid %d\n", game_uid);
 }
 
 /* ---------- bootloader / props ---------- */
@@ -869,8 +888,6 @@ static void scrub_buildprop(char *c)
 	if ((p = strstr(c, "ro.build.tags=test-keys"))) memcpy(p + 14, "release  ", 9);
 }
 
-/* magisk/ksu context ko valid init context banao: u:r:magisk:s0 ->
- * u:r:init:s0 (double space nahi, isliye parser nahi tootta) */
 static void scrub_ctx(char *c)
 {
 	char *p;
@@ -946,15 +963,61 @@ static int pre_path(struct kprobe *p, struct pt_regs *regs)
 }
 
 /* ---------- dir filter ---------- */
-struct shadow { struct kp_dir_context dc; struct kp_dir_context *orig; int pidonly; };
+struct shadow {
+	struct kp_dir_context dc;
+	struct kp_dir_context *orig;
+	int pidonly;
+	int devdir;
+	int emitted;
+};
+
+/* /dev hai kya? iterate_dir arg0 = struct file* */
+static int is_dev_dir(unsigned long filep)
+{
+	struct kp_file *f = (struct kp_file *)filep;
+	struct kp_dentry *d;
+
+	if (!kptr_ok(f)) return 0;
+	d = f->f_path.dentry;
+	if (!kptr_ok(d)) return 0;
+	if (d->d_name.len != 3 || !kptr_ok(d->d_name.name)) return 0;
+	if (memcmp(d->d_name.name, "dev", 3)) return 0;
+	if (!kptr_ok(d->d_parent)) return 0;
+	return d->d_parent->d_name.len == 1;
+}
 
 static bool filter_actor(struct kp_dir_context *c, const char *name, int namlen,
 			 loff_t off, u64 ino, unsigned type)
 {
-	struct kp_dir_context *o = ((struct shadow *)c)->orig;
+	struct shadow *s = (struct shadow *)c;
+	struct kp_dir_context *o = s->orig;
+	bool r;
+
 	c->pos = off;
+
+	/* /dev + root: apni entry pehle khud emit karo, order pe bharosa nahi.
+	 * Real entry skip ho jati hai taaki duplicate na bane. */
+	if (s->devdir) {
+		if (!s->emitted) {
+			s->emitted = 1;
+			o->pos = off;
+			o->actor(o, DEV_NAME, DEV_LEN, off, 0, 2);
+		}
+		if (namlen == DEV_LEN && !memcmp(name, DEV_NAME, DEV_LEN)) {
+			o->pos = off;
+			return true;
+		}
+		o->pos = off;
+		r = o->actor(o, name, namlen, off, ino, type);
+		c->pos = o->pos;
+		return r;
+	}
+
 	if (name_blocked(name, namlen)) { o->pos = off; return false; }
-	return o->actor(o, name, namlen, off, ino, type);
+	o->pos = off;
+	r = o->actor(o, name, namlen, off, ino, type);
+	c->pos = o->pos;
+	return r;
 }
 
 static bool filter_actor_pid(struct kp_dir_context *c, const char *name, int namlen,
@@ -962,12 +1025,17 @@ static bool filter_actor_pid(struct kp_dir_context *c, const char *name, int nam
 {
 	struct kp_dir_context *o = ((struct shadow *)c)->orig;
 	int v = 0, i;
+	bool r;
+
 	c->pos = off;
 	for (i = 0; i < namlen && name[i] >= '0' && name[i] <= '9'; i++)
 		v = v * 10 + (name[i] - '0');
 	if (i && i == namlen && v == hide_pid) { o->pos = off; return false; }
 	if (name_blocked(name, namlen)) { o->pos = off; return false; }
-	return o->actor(o, name, namlen, off, ino, type);
+	o->pos = off;
+	r = o->actor(o, name, namlen, off, ino, type);
+	c->pos = o->pos;
+	return r;
 }
 
 static void dir_before(hook_fargs4_t *f, void *ud)
@@ -975,19 +1043,28 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	struct shadow *s = (struct shadow *)F_BODY;
 	struct kp_dir_context *ctx = (struct kp_dir_context *)f->arg1;
 	int pidonly = (int)(unsigned long)ud;
+	int dev = 0;
 
 	F_FLAG = 0;
 	if (g_dir) return;
-	if (bypass() || !kptr_ok(ctx) || !kptr_ok((const void *)ctx->actor)) return;
+	if (!kptr_ok(ctx) || !kptr_ok((const void *)ctx->actor)) return;
 	if ((void *)ctx->actor == (void *)filter_actor) return;
 	if ((void *)ctx->actor == (void *)filter_actor_pid) return;
-	if (pidonly && !hide_pid) return;
+
+	if (bypass()) {
+		dev = is_dev_dir(f->arg0);
+		if (!dev) return;
+	} else if (pidonly && !hide_pid) {
+		return;
+	}
 
 	g_dir = 1;
 	s->orig = ctx;
 	memcpy(&s->dc, ctx, sizeof(*ctx));
-	s->dc.actor = pidonly ? filter_actor_pid : filter_actor;
 	s->pidonly = pidonly;
+	s->devdir = dev;
+	s->emitted = 0;
+	s->dc.actor = (pidonly && !dev) ? filter_actor_pid : filter_actor;
 	f->arg1 = (unsigned long)&s->dc;
 	F_FLAG = 1;
 }
@@ -1231,7 +1308,7 @@ static void hooks_install(void)
 		kp_path.pre_handler = pre_path;
 		if (!register_kprobe(&kp_path)) hooks_ok++;
 	}
-	pr_info("nvsvc: stage3 %u\n", hooks_ok);
+	pr_info("wanbai: stage3 %u\n", hooks_ok);
 #endif
 
 #if STAGE >= 4
@@ -1256,7 +1333,7 @@ static void hooks_install(void)
 	kr_rl.maxactive = 64;
 	if (!register_kretprobe(&kr_rl)) hooks_ok++;
 	else memset(&kr_rl, 0, sizeof(kr_rl));
-	pr_info("nvsvc: stage4 %u\n", hooks_ok);
+	pr_info("wanbai: stage4 %u\n", hooks_ok);
 #endif
 
 #if STAGE >= 5
@@ -1273,7 +1350,7 @@ static void hooks_install(void)
 		hooks_ok++;
 	else
 		piddir_addr = 0;
-	pr_info("nvsvc: stage5 %u\n", hooks_ok);
+	pr_info("wanbai: stage5 %u\n", hooks_ok);
 #endif
 
 #if STAGE >= 6
@@ -1287,7 +1364,7 @@ static void hooks_install(void)
 	hook_tr(&kr_maps, "show_map_vma", TR_MAPS);
 	hook_tr(&kr_smaps, "show_smap", TR_MAPS);
 	hook_tr(&kr_roll, "smaps_rollup_show", TR_MAPS);
-	pr_info("nvsvc: stage6 %u\n", hooks_ok);
+	pr_info("wanbai: stage6 %u\n", hooks_ok);
 #endif
 }
 
@@ -1324,13 +1401,13 @@ static void pick_fake_path(void)
 		fake_path = FAKE_DIR;
 		return;
 	}
-	pr_info("nvsvc: %s missing, using %s\n", FAKE_DIR, FAKE_FALL);
+	pr_info("wanbai: %s missing, using %s\n", FAKE_DIR, FAKE_FALL);
 }
 
 /* ---------- symbols ---------- */
 #define RS(name, slot) do { *(void **)&(slot) = kallsyms_lookup_name ? \
 	(void *)kallsyms_lookup_name(name) : 0; \
-	if (!(slot)) pr_info("nvsvc: missing %s\n", name); } while (0)
+	if (!(slot)) pr_info("wanbai: missing %s\n", name); } while (0)
 
 static int resolve_syms(void)
 {
@@ -1407,7 +1484,11 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	if (!user_ok(arg)) return 0;
 
 	if (cmd == OP_VER) {
-		int v = (API_VER << 16) | (int)hooks_ok;
+		int v = (int)(((unsigned)MAGIC << 16) | (API_VER & 0xFFFF));
+		return copy_to_user((void __user *)arg, &v, sizeof(v)) ? -EFAULT : 0;
+	}
+	if (cmd == OP_PING) {
+		int v = (int)(((unsigned)MAGIC << 16) | ((hooks_ok & 0xFF) << 8) | 0x01);
 		return copy_to_user((void __user *)arg, &v, sizeof(v)) ? -EFAULT : 0;
 	}
 	if (cmd == OP_STRICT) {
@@ -1598,19 +1679,19 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	(void)args; (void)event; (void)reserved;
 
 	if (!name_decode()) {
-		pr_info("nvsvc: owner tag tampered\n");
+		pr_info("wanbai: owner tag tampered\n");
 		return -EIO;
 	}
-	pr_info("nvsvc: %s (stage %d, strict %d)\n", owner_name, STAGE, strict);
+	pr_info("wanbai: %s (stage %d, strict %d)\n", owner_name, STAGE, strict);
 
 	r = resolve_syms();
-	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
+	if (r) { pr_info("wanbai: resolve %d\n", r); return r; }
 
 	if (kver_mm(&maj, &min)) {
 		maj = 5; min = 10;
-		pr_info("nvsvc: version unknown, assuming %u.%u\n", maj, min);
+		pr_info("wanbai: version unknown, assuming %u.%u\n", maj, min);
 	} else if (maj < 3 || (maj == 3 && min < 18)) {
-		pr_info("nvsvc: kernel %u.%u bahut purana\n", maj, min);
+		pr_info("wanbai: kernel %u.%u bahut purana\n", maj, min);
 		return -EINVAL;
 	}
 
@@ -1624,13 +1705,13 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	fops_put(poll_off, (const void *)dev_poll);
 	fops_put(uio_off, (const void *)dev_ioctl);
 	fops_put(cio_off, (const void *)dev_ioctl);
-	pr_info("nvsvc: kernel %u.%u uio=%u poll=%u\n", maj, min, uio_off, poll_off);
+	pr_info("wanbai: kernel %u.%u uio=%u poll=%u\n", maj, min, uio_off, poll_off);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
 	dev.name = DEV_NAME;
 	dev.fops = (const struct kp_fops *)fops_buf;
-	dev.mode = 0666;
+	dev.mode = 0600;
 
 	/* hooks se pehle, warna lookup khud redirect ho jayega */
 	pick_fake_path();
@@ -1638,10 +1719,10 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 
 	if (k_misc_register && k_misc_deregister) {
 		r = k_misc_register(&dev);
-		if (r) pr_info("nvsvc: misc_register %d (node skip)\n", r);
-		else { dev_ok = 1; pr_info("nvsvc: registered\n"); }
+		if (r) pr_info("wanbai: misc_register %d (node skip)\n", r);
+		else { dev_ok = 1; pr_info("wanbai: registered\n"); }
 	} else {
-		pr_info("nvsvc: misc_register missing, node skip\n");
+		pr_info("wanbai: misc_register missing, node skip\n");
 	}
 
 #if STAGE >= 2
@@ -1657,11 +1738,11 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 #if STAGE >= 3
 	hooks_install();
 	if (!hooks_ok)
-		pr_info("nvsvc: WARN koi hook nahi laga, phir bhi loaded\n");
+		pr_info("wanbai: WARN koi hook nahi laga, phir bhi loaded\n");
 #endif
 
 	inited = 1;
-	pr_info("nvsvc: loaded, %u hooks (vfs %d)\n", hooks_ok, vfs_on);
+	pr_info("wanbai: loaded, %u hooks (vfs %d, magic %04X)\n", hooks_ok, vfs_on, MAGIC);
 	return 0;
 }
 
