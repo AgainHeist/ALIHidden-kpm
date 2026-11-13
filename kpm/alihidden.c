@@ -1,8 +1,8 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v8  FINAL
+//  DARKxKERNEL KPM  (nvsvc)  v9  FINAL
 //  Owner tag: XOR-encoded + checksum-locked
 //  Kernel 3.18 - 7.x (arm64 / x86_64)  |  layout-aware
-//  Sab shim local, koi kernel type dependency nahi
+//  Saare shim structs "kp_" prefixed -> KP headers se clash nahi
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -62,7 +62,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("8.0.0");
+KPM_VERSION("9.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -131,7 +131,7 @@ KPM_DESCRIPTION("system service");
 #endif
 
 /* ============================================================
- *  KERNEL STRUCT SHIMS (3.18 - 7.x)
+ *  KERNEL STRUCT SHIMS (3.18 - 7.x) -- sab kp_ prefixed
  * ============================================================ */
 struct module;
 struct inode;
@@ -141,52 +141,51 @@ struct task_struct;
 struct anon_vma;
 struct vm_operations_struct;
 
-struct qstr { unsigned int hash; unsigned int len; const unsigned char *name; };
-struct hlist_bl_node { struct hlist_bl_node *next, **pprev; };
+struct kp_qstr { unsigned int hash; unsigned int len; const unsigned char *name; };
+struct kp_hlist_bl_node { struct kp_hlist_bl_node *next, **pprev; };
 
-struct dentry {
+struct kp_dentry {
 	unsigned int d_flags;
 	unsigned int d_seq;
-	struct hlist_bl_node d_hash;
-	struct dentry *d_parent;
-	struct qstr d_name;
+	struct kp_hlist_bl_node d_hash;
+	struct kp_dentry *d_parent;
+	struct kp_qstr d_name;
 };
 
-struct path { struct vfsmount *mnt; struct dentry *dentry; };
+struct kp_path { struct vfsmount *mnt; struct kp_dentry *dentry; };
 
 /* f_u (llist/rcu_head union) = 16 byte, f_path uske BAAD */
-struct file {
+struct kp_file {
 	void *f_u[2];
-	struct path f_path;
+	struct kp_path f_path;
 };
 
 /* kernel ka struct filename -> pehla field hi name hai */
 struct kp_filename { const char *name; };
 
-struct dir_context {
-	bool (*actor)(struct dir_context *, const char *, int, loff_t, u64, unsigned);
-	loff_t pos;
-};
+struct kp_dir_context;
+typedef bool (*kp_filldir_t)(struct kp_dir_context *, const char *, int, loff_t, u64, unsigned);
+struct kp_dir_context { kp_filldir_t actor; loff_t pos; };
 
-struct file_operations {
+struct kp_fops {
 	struct module *owner;
-	loff_t (*llseek)(struct file *, loff_t, int);
-	ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
-	ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
+	loff_t (*llseek)(struct kp_file *, loff_t, int);
+	ssize_t (*read)(struct kp_file *, char __user *, size_t, loff_t *);
+	ssize_t (*write)(struct kp_file *, const char __user *, size_t, loff_t *);
 	void *read_iter;
 	void *write_iter;
 	void *iopoll;
 	void *iterate;
 	void *iterate_shared;
 	void *poll;
-	long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
-	long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
+	long (*unlocked_ioctl)(struct kp_file *, unsigned int, unsigned long);
+	long (*compat_ioctl)(struct kp_file *, unsigned int, unsigned long);
 };
 
-struct miscdevice {
+struct kp_miscdevice {
 	int minor;
 	const char *name;
-	const struct file_operations *fops;
+	const struct kp_fops *fops;
 	struct list_head list;
 	void *parent;
 	void *this_device;
@@ -195,18 +194,20 @@ struct miscdevice {
 	umode_t mode;
 };
 
-struct seq_file { char *buf; size_t size; size_t from; size_t count; };
+struct kp_seq_file { char *buf; size_t size; size_t from; size_t count; };
 
-struct kstatfs { long f_type; long f_bsize; };
+struct kp_statfs { long f_type; long f_bsize; };
 
-struct vm_area_struct {
+struct kp_mm;
+
+struct kp_vma {
 	unsigned long vm_start;
 	unsigned long vm_end;
-	struct vm_area_struct *vm_next;
-	struct vm_area_struct *vm_prev;
+	struct kp_vma *vm_next;
+	struct kp_vma *vm_prev;
 	void *vm_rb[3];
 	unsigned long rb_subtree_gap;
-	struct mm_struct *vm_mm;
+	struct kp_mm *vm_mm;
 	unsigned long vm_page_prot;
 	unsigned long vm_flags;
 	void *vm_shared[4];
@@ -214,10 +215,10 @@ struct vm_area_struct {
 	struct anon_vma *anon_vma;
 	const struct vm_operations_struct *vm_ops;
 	unsigned long vm_pgoff;
-	struct file *vm_file;
+	struct kp_file *vm_file;
 };
 
-struct mm_struct { struct vm_area_struct *mmap; };
+struct kp_mm { struct kp_vma *mmap; };
 
 #define __NEW_UTS_LEN 64
 struct kp_utsname {
@@ -233,20 +234,20 @@ struct kp_utsns { unsigned int kref; struct kp_utsname name; };
 /* ============================================================
  *  RUNTIME SYMBOLS
  * ============================================================ */
-static int  (*k_misc_register)(struct miscdevice *);
-static void (*k_misc_deregister)(struct miscdevice *);
-static int  (*k_kern_path)(const char *, unsigned int, struct path *);
-static void (*k_path_put)(const struct path *);
+static int  (*k_misc_register)(struct kp_miscdevice *);
+static void (*k_misc_deregister)(struct kp_miscdevice *);
+static int  (*k_kern_path)(const char *, unsigned int, struct kp_path *);
+static void (*k_path_put)(const struct kp_path *);
 static struct pid *(*k_find_vpid)(int);
 static struct task_struct *(*k_pid_task)(struct pid *, int);
-static struct mm_struct *(*k_get_task_mm)(struct task_struct *);
-static void (*k_mmput)(struct mm_struct *);
+static struct kp_mm *(*k_get_task_mm)(struct task_struct *);
+static void (*k_mmput)(struct kp_mm *);
 static void (*k_get_task_struct)(struct task_struct *);
 static void (*k_put_task_struct)(struct task_struct *);
 static void *(*k_kvmalloc)(unsigned long, int);
 static void (*k_kvfree)(void *);
 static int  (*k_access_process_vm)(struct task_struct *, unsigned long, void *, int, int);
-static loff_t (*k_no_llseek)(struct file *, loff_t, int);
+static loff_t (*k_no_llseek)(struct kp_file *, loff_t, int);
 static int  (*k_copy_from_user)(void *, const void __user *, unsigned long);
 static int  *k_kptr_restrict;
 static char **k_saved_cmdline;
@@ -266,8 +267,6 @@ static int kptr_ok(const void *p)
 
 /* ============================================================
  *  file_operations offset  ->  layout-agnostic
- *  primary: def_chr_fops probe (usme sirf .open set hota hai)
- *  fallback: version table
  * ============================================================ */
 #define FOPS_MAX 384
 static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
@@ -284,8 +283,6 @@ static int fops_offsets(unsigned int maj, unsigned int min)
 	const unsigned long *p;
 	unsigned int i, idx, delta;
 
-	/* unlocked_ioctl ke baad: compat_ioctl, mmap,
-	 * [mmap_supported_flags 4.20+], open  ->  delta 3 ya 4 */
 	delta = (maj > 4 || (maj == 4 && min >= 20)) ? 4 : 3;
 
 	p = (const unsigned long *)kallsyms_lookup_name("def_chr_fops");
@@ -302,7 +299,6 @@ static int fops_offsets(unsigned int maj, unsigned int min)
 		}
 	}
 
-	/* table fallback */
 	if (maj >= 7) idx = 9;
 	else if (maj == 6) idx = (min >= 6) ? 9 : 10;
 	else if (maj == 5) idx = (min == 0) ? 9 : 10;
@@ -818,21 +814,21 @@ static int pre_path(struct kprobe *p, struct pt_regs *regs)
 }
 
 /* ---------- dir filter ---------- */
-struct shadow { struct dir_context dc; struct dir_context *orig; int pidonly; };
+struct shadow { struct kp_dir_context dc; struct kp_dir_context *orig; int pidonly; };
 
-static bool filter_actor(struct dir_context *c, const char *name, int namlen,
+static bool filter_actor(struct kp_dir_context *c, const char *name, int namlen,
 			 loff_t off, u64 ino, unsigned type)
 {
-	struct dir_context *o = ((struct shadow *)c)->orig;
+	struct kp_dir_context *o = ((struct shadow *)c)->orig;
 	c->pos = off;
 	if (name_blocked(name, namlen)) { o->pos = off; return false; }
 	return o->actor(o, name, namlen, off, ino, type);
 }
 
-static bool filter_actor_pid(struct dir_context *c, const char *name, int namlen,
+static bool filter_actor_pid(struct kp_dir_context *c, const char *name, int namlen,
 			     loff_t off, u64 ino, unsigned type)
 {
-	struct dir_context *o = ((struct shadow *)c)->orig;
+	struct kp_dir_context *o = ((struct shadow *)c)->orig;
 	int v = 0, i;
 	c->pos = off;
 	for (i = 0; i < namlen && name[i] >= '0' && name[i] <= '9'; i++)
@@ -845,11 +841,11 @@ static bool filter_actor_pid(struct dir_context *c, const char *name, int namlen
 static void dir_before(hook_fargs4_t *f, void *ud)
 {
 	struct shadow *s = (struct shadow *)f->local.data;
-	struct dir_context *ctx = (struct dir_context *)f->arg1;
+	struct kp_dir_context *ctx = (struct kp_dir_context *)f->arg1;
 	int pidonly = (int)(unsigned long)ud;
 
 	f->local.data[7] = 0;
-	if (bypass() || !kptr_ok(ctx) || !kptr_ok(ctx->actor)) return;
+	if (bypass() || !kptr_ok(ctx) || !kptr_ok((const void *)ctx->actor)) return;
 	if ((void *)ctx->actor == (void *)filter_actor) return;
 	if (pidonly && !hide_pid) return;
 
@@ -874,7 +870,7 @@ static struct kretprobe kr_pread, kr_bprop;
 
 static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct file *f = (struct file *)P_ARG0(regs);
+	struct kp_file *f = (struct kp_file *)P_ARG0(regs);
 	int *mode = (int *)ri->data;
 	const char *n;
 	*mode = 0;
@@ -926,7 +922,7 @@ static int entry_statfs(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static int post_statfs(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	struct kstatfs *st = (struct kstatfs *)P_ARG1(regs);
+	struct kp_statfs *st = (struct kp_statfs *)P_ARG1(regs);
 	(void)ri;
 	if (bypass() || !kptr_ok(st)) return 0;
 	if (st->f_type == OVERLAY_MAGIC) st->f_type = EXT4_MAGIC;
@@ -962,14 +958,14 @@ static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 /* ---------- seq compaction ---------- */
-struct tr_data { struct seq_file *m; long saved; int maps; };
+struct tr_data { struct kp_seq_file *m; long saved; int maps; };
 static struct kretprobe kr_mounts, kr_mountinfo, kr_modules, kr_misc;
 static struct kretprobe kr_fs, kr_vm, kr_status, kr_smaps, kr_maps, kr_roll;
 
 static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct tr_data *d = (struct tr_data *)ri->data;
-	struct seq_file *m = (struct seq_file *)P_ARG0(regs);
+	struct kp_seq_file *m = (struct kp_seq_file *)P_ARG0(regs);
 	d->m = m; d->saved = 0; d->maps = 0;
 	if (bypass() || !kptr_ok(m) || !kptr_ok(m->buf)) return 0;
 	if (m->size < m->count || m->size > 0x100000) return 0;
@@ -1011,7 +1007,7 @@ static void defang_perms(char *buf, long start, long end)
 static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct tr_data *d = (struct tr_data *)ri->data;
-	struct seq_file *m = d->m;
+	struct kp_seq_file *m = d->m;
 	long i, o, end;
 	(void)regs;
 	if (!d->saved || !kptr_ok(m) || (long)m->count <= d->saved) return 0;
@@ -1141,7 +1137,7 @@ static void hooks_remove(void)
 
 static void pick_fake_path(void)
 {
-	struct path p;
+	struct kp_path p;
 	if (!k_kern_path || !k_path_put) return;
 	if (!k_kern_path(FAKE_DIR, LOOKUP_DIRECTORY | LOOKUP_FOLLOW, &p)) {
 		k_path_put(&p);
@@ -1212,7 +1208,7 @@ static void wb_size(unsigned long arg, int c32, unsigned long long sz)
 	}
 }
 
-static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 {
 	struct copy_mem cm;
 	struct task_struct *tsk;
@@ -1253,8 +1249,8 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 	if (cmd == OP_BASE) {
 		struct mod_base mb;
-		struct mm_struct *mm;
-		struct vm_area_struct *vma;
+		struct kp_mm *mm;
+		struct kp_vma *vma;
 		char pname[256];
 		unsigned long long found = 0;
 		int guard = 0;
@@ -1333,7 +1329,7 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	return ret < 0 ? ret : -EIO;
 }
 
-static struct miscdevice dev;
+static struct kp_miscdevice dev;
 
 static long owner_ctl(const char *ctl_args, char __user *out_msg, int outlen)
 {
@@ -1362,7 +1358,6 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	r = resolve_syms();
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
 
-	/* ---- hard guard: galat kernel par bootloop nahi ---- */
 	if (kver_mm(&maj, &min)) {
 		pr_info("nvsvc: kernel version nahi padhi ja saki\n");
 		return -EINVAL;
@@ -1386,7 +1381,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
 	dev.name = DEV_NAME;
-	dev.fops = (const struct file_operations *)fops_buf;
+	dev.fops = (const struct kp_fops *)fops_buf;
 	dev.mode = 0666;
 
 	pick_fake_path();
