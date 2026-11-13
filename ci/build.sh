@@ -1,21 +1,16 @@
 #!/bin/bash
 set -e
-
-# APatch app me jo KernelPatch version dikhta hai, wahi yahan daal
-# (ya dmesg | grep 'Kernel Patch Version' ka tag). Default latest.
 KP_REF="${KP_REF:-main}"
 
-echo "::group::fetch KernelPatch ($KP_REF)"
-git clone --quiet https://github.com/bmax121/KernelPatch.git kp
+git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
 cd kp
-git checkout --quiet "$KP_REF" || { echo "ref $KP_REF nahi mila"; exit 1; }
+if [ "$KP_REF" != "main" ]; then
+    git fetch --depth=1 origin "refs/tags/$KP_REF:refs/tags/$KP_REF" 2>/dev/null || true
+    git checkout "$KP_REF" 2>/dev/null || { echo "KP_REF $KP_REF nahi mila, main par build"; git checkout main; }
+fi
+test -f kernel/include/kpmodule.h
 echo "KP commit: $(git rev-parse --short HEAD)"
-ls -l kernel/include/kputils.h kernel/include/kpmodule.h
 cd ..
-echo "::endgroup::"
 
-echo "::group::build"
-make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu-
-echo "::endgroup::"
-
+make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu- STAGE="${STAGE:-6}"
 ls -la kpm/*.kpm
