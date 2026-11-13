@@ -1,14 +1,10 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v17  FAST-HIDE
-//  v17:
-//   - hook recursion guard (depth) -> fault ke andar nested hook
-//     se stack udna band
-//   - is_hidden/name_blocked me first-char switch (90% lookup
-//     bina compare ke nikal jate hain)
-//   - name_entry me ek hi user-read (1-byte probe hata)
-//   - maps/smaps ke liye alag chhoti needle list + line len cap
-//   - TracerPid sirf status par, maps par nahi
-//   - magiskd / kpatchd bhi hidden
+//  DARKxKERNEL KPM  (nvsvc)  v18  STABLE-HIDE
+//  v18:
+//   - vfs_read hook DEFAULT OFF (sabse hot path) -> OP_VFS se on
+//   - per-category recursion guard (name/read/seq/dir alag)
+//   - attr/current scrub ab valid context banata hai
+//   - kp ke extra paths bhi hidden
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -59,7 +55,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("16.0.0");
+KPM_VERSION("17.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -471,7 +467,8 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_GBYP    0x80B
 #define OP_OFF     0x80C
 #define OP_FLUSH   0x80D
-#define API_VER    9
+#define OP_VFS     0x80E
+#define API_VER    10
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -499,12 +496,15 @@ static int  mgr_uid = -1;
 static int  game_uid = -1;
 static int  game_byp;        /* default 0: game ko bhi poora hide */
 static int  hooks_off;
-static int  hook_depth;      /* recursion guard */
+static int  vfs_on;          /* vfs_read hook default off */
 static int  abi_force = -1;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
 static unsigned long iterate_addr, piddir_addr;
 static char *cmd_end;
+
+/* per-category recursion guards */
+static int g_name, g_read, g_seq, g_dir;
 
 /* root + manager bypass (game sirf tab jab game_byp on ho) */
 static int bypass(void)
@@ -519,9 +519,10 @@ static int bypass(void)
 
 static const char *const hidden[] = {
 	"/data/adb", "/sbin/su", "/system/bin/su", "/system/xbin/su",
-	"/vendor/bin/su", "/system/bin/.ext", "/debug_ramdisk",
-	"/sbin/.magisk", "/system/bin/magisk", "/system/bin/ksud",
-	"/system/bin/apd", "/system/bin/kp", "/system/etc/init/magisk",
+	"/vendor/bin/su", "/vendor/bin/kp", "/system/xbin/kp",
+	"/system/bin/.ext", "/debug_ramdisk", "/sbin/.magisk",
+	"/system/bin/magisk", "/system/bin/ksud", "/system/bin/apd",
+	"/system/bin/kp", "/system/etc/init/magisk",
 	"/system/etc/init/init.magisk.rc", "/system/etc/init/init.kpatch.rc",
 	"/system/app/Magisk", "/cache/magisk.log", "/data/magisk",
 	"/data/data/com.topjohnwu.magisk",
@@ -553,7 +554,6 @@ static const char *const blk_pfx[] = {
 };
 #define BLK_PF ARRAY_SIZE(blk_pfx)
 
-/* poora set -- /proc/modules, /proc/misc, mounts, status */
 static const char *const blk_text[] = {
 	"kpatch", "APatch", "KernelSU", "magisk", "Magisk", "ksud", "apd",
 	"overlay", "nvsvc", ".__np", "debug_ramdisk", "libnvsvc",
@@ -562,7 +562,6 @@ static const char *const blk_text[] = {
 };
 #define BLK_T ARRAY_SIZE(blk_text)
 
-/* chhota set -- maps/smaps (hazaaron line) */
 static const char *const blk_maps[] = {
 	"overlay", "/data/adb", "nvsvc", "libnvsvc", "debug_ramdisk",
 	"/data/local/tmp", "zygisk", ".__np",
@@ -870,12 +869,30 @@ static void scrub_buildprop(char *c)
 	if ((p = strstr(c, "ro.build.tags=test-keys"))) memcpy(p + 14, "release  ", 9);
 }
 
+/* magisk/ksu context ko valid init context banao: u:r:magisk:s0 ->
+ * u:r:init:s0 (double space nahi, isliye parser nahi tootta) */
 static void scrub_ctx(char *c)
 {
 	char *p;
-	if ((p = strstr(c, "kernelsu"))) memcpy(p, "init    ", 8);
-	if ((p = strstr(c, "magisk"))) memcpy(p, "init  ", 6);
-	if ((p = strstr(c, "ksu"))) memcpy(p, "init", 4);
+	long tail;
+
+	if ((p = strstr(c, "kernelsu"))) {
+		tail = (long)strlen(p + 8);
+		memcpy(p, "init", 4);
+		memmove(p + 4, p + 8, tail + 1);
+		return;
+	}
+	if ((p = strstr(c, "magisk"))) {
+		tail = (long)strlen(p + 6);
+		memcpy(p, "init", 4);
+		memmove(p + 4, p + 6, tail + 1);
+		return;
+	}
+	if ((p = strstr(c, "ksu"))) {
+		tail = (long)strlen(p + 3);
+		memmove(p + 4, p + 3, tail + 1);
+		memcpy(p, "init", 4);
+	}
 }
 
 /* ---------- getname ---------- */
@@ -894,9 +911,9 @@ static int name_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	d->hide = 0;
 	d->guard = 0;
-	if (hook_depth) return 1;
+	if (g_name) return 1;
 	if (bypass() || !u) return 1;
-	hook_depth = 1;
+	g_name = 1;
 	d->guard = 1;
 	if (strncpy_from_user(d->path, u, sizeof(d->path) - 1) < 0) { d->path[0] = '\0'; return 1; }
 	d->path[sizeof(d->path) - 1] = '\0';
@@ -908,7 +925,7 @@ static int name_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gp_data *d = (struct gp_data *)ri->data;
 	struct kp_filename *fn = (struct kp_filename *)P_RET(regs);
-	if (d->guard) hook_depth = 0;
+	if (d->guard) g_name = 0;
 	if (!d->hide || !kptr_ok(fn) || IS_ERR(fn) || !kptr_ok(fn->name)) return 0;
 	kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
 	return 0;
@@ -960,13 +977,13 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	int pidonly = (int)(unsigned long)ud;
 
 	F_FLAG = 0;
-	if (hook_depth) return;
+	if (g_dir) return;
 	if (bypass() || !kptr_ok(ctx) || !kptr_ok((const void *)ctx->actor)) return;
 	if ((void *)ctx->actor == (void *)filter_actor) return;
 	if ((void *)ctx->actor == (void *)filter_actor_pid) return;
 	if (pidonly && !hide_pid) return;
 
-	hook_depth = 1;
+	g_dir = 1;
 	s->orig = ctx;
 	memcpy(&s->dc, ctx, sizeof(*ctx));
 	s->dc.actor = pidonly ? filter_actor_pid : filter_actor;
@@ -980,7 +997,7 @@ static void dir_after(hook_fargs4_t *f, void *ud)
 	struct shadow *s = (struct shadow *)F_BODY;
 	(void)ud;
 	if (!F_FLAG) return;
-	hook_depth = 0;
+	g_dir = 0;
 	s->orig->pos = s->dc.pos;
 }
 
@@ -995,11 +1012,9 @@ static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	unsigned int len;
 
 	*mode = 0;
-	if (hook_depth) return 0;
+	if (g_read) return 0;
 	if (bypass() || !kptr_ok(f) || !kptr_ok(f->f_path.dentry)) return 0;
 
-	/* sasta prefilter: sirf cmdline(7) bootargs(8) current(7)
-	 * enforce(7) build.prop(10) hi aage jaate hain */
 	len = f->f_path.dentry->d_name.len;
 	if (len != 7 && len != 8 && len != 10) return 0;
 
@@ -1026,9 +1041,9 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	long n;
 
 	if (!mode || ret <= 0 || !user_ok((unsigned long)ub)) return 0;
-	hook_depth = 1;
+	g_read = 1;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
-	if (copy_from_user(buf, ub, n)) { hook_depth = 0; return 0; }
+	if (copy_from_user(buf, ub, n)) { g_read = 0; return 0; }
 	buf[n] = '\0';
 	switch (mode) {
 	case 1: cmd_end = buf + n; scrub_boot_args(buf); cmd_end = NULL; break;
@@ -1038,7 +1053,7 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	default: break;
 	}
 	copy_to_user(ub, buf, n);
-	hook_depth = 0;
+	g_read = 0;
 	return 0;
 }
 
@@ -1103,11 +1118,11 @@ static int tr_entry_kind(struct kretprobe_instance *ri, struct pt_regs *regs, in
 	struct kp_seq_file *m = (struct kp_seq_file *)P_ARG0(regs);
 
 	d->m = m; d->saved = 0; d->kind = kind; d->ok = 0;
-	if (hook_depth) return 0;
+	if (g_seq) return 0;
 	if (bypass() || !kptr_ok(m) || !kptr_ok(m->buf)) return 0;
 	if (m->size < 64 || m->size > 0x100000) return 0;
 	if (m->count > m->size) return 0;
-	hook_depth = 1;
+	g_seq = 1;
 	d->saved = (long)m->count;
 	d->ok = 1;
 	return 1;
@@ -1154,7 +1169,7 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	(void)regs;
 
 	if (!d->ok) return 0;
-	hook_depth = 0;
+	g_seq = 0;
 	if (!kptr_ok(m) || (long)m->count <= d->saved) return 0;
 	if ((unsigned long)m->count > m->size) return 0;
 
@@ -1191,6 +1206,19 @@ static void hook_tr(struct kretprobe *kr, const char *sym, int kind)
 	memset(kr, 0, sizeof(*kr));
 }
 
+static void hook_bprop(int on)
+{
+	if (on) {
+		if (kr_bprop.hooked) return;
+		kr_bprop.data_size = sizeof(int);
+		kr_bprop.entry_handler = pre_read;
+		kr_bprop.handler = post_read;
+		hook_tr(&kr_bprop, "vfs_read", TR_TEXT);
+	} else if (kr_bprop.hooked) {
+		unregister_kretprobe(&kr_bprop);
+	}
+}
+
 static void hooks_install(void)
 {
 #if STAGE >= 3
@@ -1208,13 +1236,10 @@ static void hooks_install(void)
 
 #if STAGE >= 4
 	kr_pread.data_size = sizeof(int);
-	kr_bprop.data_size = sizeof(int);
 	kr_pread.entry_handler = pre_read;
-	kr_bprop.entry_handler = pre_read;
 	kr_pread.handler = post_read;
-	kr_bprop.handler = post_read;
 	hook_tr(&kr_pread, "proc_reg_read", TR_TEXT);
-	hook_tr(&kr_bprop, "vfs_read", TR_TEXT);
+	hook_bprop(vfs_on);
 
 	kr_statfs.kp.symbol_name = "vfs_statfs";
 	kr_statfs.data_size = 0;
@@ -1413,6 +1438,13 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
 		game_byp = v;
+		return 0;
+	}
+	if (cmd == OP_VFS) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		vfs_on = !!v;
+		hook_bprop(vfs_on);
 		return 0;
 	}
 	if (cmd == OP_OFF) {
@@ -1629,7 +1661,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 #endif
 
 	inited = 1;
-	pr_info("nvsvc: loaded, %u hooks\n", hooks_ok);
+	pr_info("nvsvc: loaded, %u hooks (vfs %d)\n", hooks_ok, vfs_on);
 	return 0;
 }
 
@@ -1639,7 +1671,7 @@ static long nvsvc_stop(void *__user reserved)
 	if (!inited) return 0;
 	inited = 0;
 	hooks_off = 0;
-	hook_depth = 0;
+	g_name = g_read = g_seq = g_dir = 0;
 	hooks_remove();
 	if (kptr_saved && kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
 	uts_restore();
