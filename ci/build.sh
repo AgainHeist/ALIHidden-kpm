@@ -1,17 +1,15 @@
 #!/bin/bash
 set -e
-KP_REF="${KP_REF:-main}"
-STAGE="${STAGE:-6}"
+KP_REF="${KP_REF:-0.13.1}"
+STAGE="${STAGE:-5}"
+BTI="${BTI:-0}"
 
-git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
-cd kp
-if [ "$KP_REF" != "main" ]; then
-    git fetch --depth=1 origin "refs/tags/$KP_REF:refs/tags/$KP_REF" 2>/dev/null || true
-    git checkout "$KP_REF" 2>/dev/null || { echo "KP_REF $KP_REF nahi mila, main par"; git checkout main; }
-fi
-test -f kernel/include/kpmodule.h
-echo "KP commit: $(git rev-parse --short HEAD)"
-cd ..
+git clone --depth=1 --branch "$KP_REF" https://github.com/bmax121/KernelPatch.git kp 2>/dev/null || {
+    echo "!! KP_REF $KP_REF clone fail — main (ABI mismatch risk)"
+    git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
+}
+test -f kp/kernel/include/kpmodule.h || { echo "!! kpmodule.h nahi mila"; exit 1; }
+echo "KP commit: $(git -C kp rev-parse --short HEAD)"
 
-make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu- STAGE="$STAGE"
+make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu- STAGE="$STAGE" BTI="$BTI"
 ls -la kpm/*.kpm
