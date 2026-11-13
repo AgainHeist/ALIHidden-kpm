@@ -16,20 +16,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make git gcc-aarch64-linux-gnu
 
-      - name: fetch KernelPatch
+      - name: fetch KernelPatch (pinned: kputils.h era)
         run: |
-          git clone --depth=1 https://github.com/bmax121/KernelPatch.git kp
-          ls kp/kernel/include/kpmodule.h
-          ls kp/kernel/include/ktypes.h
+          git clone https://github.com/bmax121/KernelPatch.git kp
+          cd kp
+          git checkout $(git log --before=2026-10-01 -1 --format=%H)
+          ls kernel/include/kpmodule.h kernel/include/kputils.h kernel/include/ktypes.h
 
       - name: build
         run: |
           make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu-
-          ls -la kpm
+          ls -la kpm/*.kpm
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ALiHidden-kpm
+          name: Owner_By_ali-kpm
           path: "**/*.kpm"
-          if-no-files-found: warn
+          if-no-files-found: error
