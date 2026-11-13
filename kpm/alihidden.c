@@ -1,7 +1,8 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v5
+//  DARKxKERNEL KPM  (nvsvc)  v6
 //  Owner tag: XOR-encoded + checksum-locked
 //  Kernel 5.4 - 6.12+ (arm64 / x86_64)  |  version-guarded
+//  Koi kernel-type dependency nahi, sab local shim
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -61,7 +62,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("5.0.0");
+KPM_VERSION("6.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -130,7 +131,8 @@ KPM_DESCRIPTION("system service");
 #endif
 
 /* ============================================================
- *  KERNEL STRUCT SHIMS (5.4 - 6.12)
+ *  KERNEL STRUCT SHIMS (5.4 - 6.12)   --  sab local, koi include
+ *  par depend nahi (list_head / umode_t / filename bhi shim)
  * ============================================================ */
 struct module;
 struct inode;
@@ -165,16 +167,19 @@ struct dir_context {
 	loff_t pos;
 };
 
+/* kernel ka struct filename -> pehla field hi name hai */
+struct kp_filename { const char *name; };
+
 struct miscdevice {
 	int minor;
 	const char *name;
 	const void *fops;
-	struct list_head list;
+	void *list[2];          /* struct list_head */
 	void *parent;
 	void *this_device;
 	const void *groups;
 	const char *nodename;
-	umode_t mode;
+	unsigned short mode;    /* umode_t */
 };
 
 struct seq_file { char *buf; size_t size; size_t from; size_t count; };
@@ -192,7 +197,7 @@ struct vm_area_struct {
 	unsigned long vm_page_prot;
 	unsigned long vm_flags;
 	void *vm_shared[4];
-	struct list_head anon_vma_chain;
+	void *anon_vma_chain[2];
 	struct anon_vma *anon_vma;
 	const struct vm_operations_struct *vm_ops;
 	unsigned long vm_pgoff;
@@ -248,8 +253,8 @@ static int kptr_ok(const void *p)
 
 /* ============================================================
  *  file_operations  ->  offset self-calibration
- *  (struct layout version ke hisaab se badalta hai, isliye
- *   hardcoded cast nahi: ek zeroed byte buffer + computed off)
+ *  layout version ke hisaab se badalta hai, isliye zeroed buffer
+ *  + computed offset (hardcoded cast nahi)
  * ============================================================ */
 #define FOPS_MAX 384
 static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
@@ -261,19 +266,19 @@ static void fops_put(unsigned int off, void *fn)
 		*(void **)(fops_buf + off) = fn;
 }
 
-/* base layout: owner(0) llseek(1) read(2) write(3) read_iter(4)
- * write_iter(5) iopoll(6) [iterate(7)] iterate_shared poll
- * unlocked_ioctl compat_ioctl ...  ->  'iterate' 6.6 me hata hai */
+/* owner(0) llseek(1) read(2) write(3) read_iter(4) write_iter(5)
+ * iopoll(6) [iterate(7)] iterate_shared poll unlocked_ioctl ...
+ * 'iterate' 6.6 me hata hai -> 5.4-6.5 = 80, 6.6+ = 72 */
 static void fops_table(unsigned int maj, unsigned int min)
 {
 	unsigned int idx = 10;
 	if (maj > 6 || (maj == 6 && min >= 6))
 		idx = 9;
-	uio_off = idx * sizeof(void *);
-	cio_off = uio_off + sizeof(void *);
+	uio_off = idx * (unsigned int)sizeof(void *);
+	cio_off = uio_off + (unsigned int)sizeof(void *);
 }
 
-/* def_chr_fops me sirf .open set hota hai -> usse offset verify */
+/* def_chr_fops me sirf .open set hota hai -> offset cross-check */
 static void fops_probe(void)
 {
 	const unsigned long *p = (const unsigned long *)kallsyms_lookup_name("def_chr_fops");
@@ -282,10 +287,10 @@ static void fops_probe(void)
 	if (!p) return;
 	for (i = 4; i < 20; i++) {
 		if (!kptr_ok((const void *)p[i])) continue;
-		off = (i - 4) * sizeof(void *);
+		off = (i - 4) * (unsigned int)sizeof(void *);
 		if (off != 72 && off != 80) return;
 		uio_off = off;
-		cio_off = off + sizeof(void *);
+		cio_off = off + (unsigned int)sizeof(void *);
 		pr_info("nvsvc: fops probe uio=%u\n", off);
 		return;
 	}
@@ -773,7 +778,7 @@ static int name_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 static int name_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gp_data *d = (struct gp_data *)ri->data;
-	struct filename *fn = (struct filename *)P_RET(regs);
+	struct kp_filename *fn = (struct kp_filename *)P_RET(regs);
 	if (!d->hide || !kptr_ok(fn) || IS_ERR(fn) || !kptr_ok(fn->name)) return 0;
 	kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
 	return 0;
@@ -783,10 +788,10 @@ static struct kprobe kp_path;
 
 static int pre_path(struct kprobe *p, struct pt_regs *regs)
 {
-	struct filename *fn;
+	struct kp_filename *fn;
 	(void)p;
 	if (bypass()) return 0;
-	fn = (struct filename *)P_ARG1(regs);
+	fn = (struct kp_filename *)P_ARG1(regs);
 	if (!kptr_ok(fn) || !kptr_ok(fn->name)) return 0;
 	if (is_hidden(fn->name))
 		kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
@@ -1271,7 +1276,8 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
 		if (c32) {
 #ifdef CONFIG_COMPAT
-			struct mod_base32 y = { mb.pid, (unsigned int)mb.name, (unsigned int)found };
+			struct mod_base32 y;
+			y.pid = mb.pid; y.name = (unsigned int)mb.name; y.base = (unsigned int)found;
 			copy_to_user((void __user *)arg, &y, sizeof(y));
 #endif
 		} else copy_to_user((void __user *)arg, &mb, sizeof(mb));
@@ -1353,7 +1359,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 		return -EINVAL;
 	}
 	memset(fops_buf, 0, sizeof(fops_buf));
-	fops_put(sizeof(void *), (void *)k_no_llseek);
+	fops_put((unsigned int)sizeof(void *), (void *)k_no_llseek);
 	fops_put(uio_off, (void *)dev_ioctl);
 #ifdef CONFIG_COMPAT
 	fops_put(cio_off, (void *)dev_ioctl);
