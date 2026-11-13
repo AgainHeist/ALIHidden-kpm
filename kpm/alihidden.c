@@ -1,22 +1,18 @@
 // ============================================================
-//  DARKxKERNEL KPM  (wanbai)  v31.0  — FINAL
+//  DARKxKERNEL KPM  (wanbai)  v31.1  — FINAL
 //
 //  ditPro ke dono KPM ki tarah: koi uid/app detect nahi,
 //  koi "sirf is app ke liye" shart nahi. Sab kuch hamesha on.
 //
-//  v31 (2nd + 3rd pass me mile bug):
-//   1. post_read: buf[320] par n 319 tak ja raha tha, par
-//      scrub_ctx "ksu" branch 1 byte grow karta hai -> 1 byte
-//      stack overflow. Ab n cap = sizeof(buf) - 8.
-//   2. set_bootstate red: room() tail+6 maang raha tha,
-//      zarurat tail+5 ki hai -> red case kabhi chalta hi nahi tha.
-//   3. set_verity: room() tail+10, "logging" (7) ke liye
-//      tail+9 chahiye -> logging case dead tha.
+//  v31.1: blk_name[] me invisible UTF-8 char tha -> build fail.
+//         Line clean ASCII me tod di. Baaki logic v31 jaisa.
 //
-//  v30 se: koi uid detect nahi (bypass() turant 0, current_uid()
-//  call hi nahi), 2-phase hook install + live_probe() rollback.
-//  v29 se: hook local 48-byte cap + static assert, dmesg default
-//  off, fops 7..12, filter_actor duplicate d_off fix.
+//  v31: post_read stack reserve (ksu grow), set_bootstate red
+//       room tail+5, set_verity tail+9.
+//  v30: koi uid detect nahi (bypass() turant 0), 2-phase hook
+//       install + live_probe() rollback.
+//  v29: hook local 48-byte cap + static assert, dmesg default off,
+//       fops 7..12, filter_actor duplicate d_off fix.
 //
 //  BTF offsets sirf "/" selftest pass hone par. Fail = defaults.
 // ============================================================
@@ -70,7 +66,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("31.0.0");
+KPM_VERSION("31.1.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -883,8 +879,9 @@ static const char *const hidden[] = {
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
 static const char *const blk_name[] = {
-	"su", "magisk", "Magisk", "magiskd", "ksud",<｜begin▁of▁sentence｜>Arg, "apd", "adb", "kpatch",
-	"kpatchd", "kp", "wanbai", ".__np", ".magisk", ".ext", "debug_ramdisk",
+	"su", "magisk", "Magisk", "magiskd", "ksud",
+	"apd", "adb", "kpatch", "kpatchd", "kp", "wanbai",
+	".__np", ".magisk", ".ext", "debug_ramdisk",
 	"libnvsvc.so", "init.magisk.rc", "init.kpatch.rc", "config.gz",
 	"zygisk", "zygiskd", "libzygisk.so", "libzygiskd.so", "tmp",
 	"android.system.svc", "system_log_svc", "STEMMERX.sh",
@@ -1396,7 +1393,7 @@ static void set_bootstate(char *c)
 	}
 	if (!strncmp(v, "red", 3)) {
 		tail = (long)strlen(v + 3);
-		/* v+3+tail = NUL, write last byte v+tail+5 */
+		/* v+3+tail = NUL, last write byte v+tail+5 */
 		if (!room(v, tail + 5)) return;
 		memmove(v + 5, v + 3, tail + 1);
 		memcpy(v, "green", 5);
@@ -1431,7 +1428,7 @@ static void set_verity(char *c)
 	else return;
 
 	tail = (long)strlen(v + vlen);
-	/* last byte v+9+tail; cmd_end NUL+2 = v+vlen+tail+2 >= v+tail+9 */
+	/* last write byte v+9+tail; cmd_end = NUL+2 = v+vlen+tail+2 */
 	if (!room(v, tail + 9)) return;
 	memmove(v + 9, v + vlen, tail + 1);
 	memcpy(v, "enforcing", 9);
