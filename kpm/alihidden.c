@@ -1,8 +1,8 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v9  FINAL
+//  DARKxKERNEL KPM  (nvsvc)  v10  PANIC-SAFE
 //  Owner tag: XOR-encoded + checksum-locked
-//  Kernel 3.18 - 7.x (arm64 / x86_64)  |  layout-aware
-//  Saare shim structs "kp_" prefixed -> KP headers se clash nahi
+//  Kernel 3.18 - 7.x (arm64 / x86_64)
+//  fops ka HAR slot dev_ioctl -> offset galat ho to bhi panic nahi
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -62,7 +62,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("9.0.0");
+KPM_VERSION("10.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -115,6 +115,8 @@ KPM_DESCRIPTION("system service");
 #ifndef MISC_DYNAMIC_MINOR
 #define MISC_DYNAMIC_MINOR 255
 #endif
+
+#define USER_TOP 0x0001000000000000UL
 
 #if defined(__aarch64__)
 # define P_ARG0(r) ((r)->regs[0])
@@ -265,8 +267,13 @@ static int kptr_ok(const void *p)
 	return a >= 0xffff000000000000UL && a != ~0UL;
 }
 
+static int user_ok(unsigned long a)
+{
+	return a && a < USER_TOP;
+}
+
 /* ============================================================
- *  file_operations offset  ->  layout-agnostic
+ *  fops buffer: HAR slot dev_ioctl  (owner slot NULL rehta hai)
  * ============================================================ */
 #define FOPS_MAX 384
 static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
@@ -278,37 +285,17 @@ static void fops_put(unsigned int off, const void *fn)
 		*(const void **)(fops_buf + off) = fn;
 }
 
-static int fops_offsets(unsigned int maj, unsigned int min)
+/* sirf log ke liye; galat ho to bhi koi nuksan nahi */
+static void fops_guess(unsigned int maj, unsigned int min)
 {
-	const unsigned long *p;
-	unsigned int i, idx, delta;
-
-	delta = (maj > 4 || (maj == 4 && min >= 20)) ? 4 : 3;
-
-	p = (const unsigned long *)kallsyms_lookup_name("def_chr_fops");
-	if (p) {
-		for (i = 8; i < 18; i++) {
-			if (!kptr_ok((const void *)p[i])) continue;
-			if (i < delta + 6) return -EINVAL;
-			idx = i - delta;
-			if (idx < 6 || idx > 12) return -EINVAL;
-			uio_off = idx * (unsigned int)sizeof(void *);
-			cio_off = uio_off + (unsigned int)sizeof(void *);
-			pr_info("nvsvc: fops probe uio=%u\n", uio_off);
-			return 0;
-		}
-	}
-
+	unsigned int idx;
 	if (maj >= 7) idx = 9;
 	else if (maj == 6) idx = (min >= 6) ? 9 : 10;
 	else if (maj == 5) idx = (min == 0) ? 9 : 10;
 	else if (maj == 4) idx = (min >= 7) ? 9 : 8;
 	else idx = 8;
-
 	uio_off = idx * (unsigned int)sizeof(void *);
 	cio_off = uio_off + (unsigned int)sizeof(void *);
-	pr_info("nvsvc: fops table uio=%u\n", uio_off);
-	return (uio_off >= 48 && uio_off <= 104) ? 0 : -EINVAL;
 }
 
 /* ============================================================
@@ -339,6 +326,10 @@ struct kretprobe {
 #ifndef regs_return_value
 #define regs_return_value(r) P_RET(r)
 #endif
+
+/* local.data[0] = flag, shadow/data data[1] se shuru */
+#define F_FLAG f->local.data[0]
+#define F_BODY ((void *)(f->local.data + 1))
 
 #if defined(__aarch64__)
 static void regs_in(struct pt_regs *r, hook_fargs4_t *f)
@@ -391,11 +382,11 @@ static void kret_before(hook_fargs4_t *f, void *ud)
 	struct kretprobe *kr = (struct kretprobe *)ud;
 	struct kretprobe_instance ri;
 	struct pt_regs r;
-	f->local.data[7] = 0;
+	F_FLAG = 0;
 	if (!kr->entry_handler) return;
-	ri.data = f->local.data;
+	ri.data = F_BODY;
 	regs_in(&r, f);
-	f->local.data[7] = kr->entry_handler(&ri, &r) ? 1 : 0;
+	F_FLAG = kr->entry_handler(&ri, &r) ? 1 : 0;
 	regs_out(f, &r);
 }
 
@@ -404,8 +395,8 @@ static void kret_after(hook_fargs4_t *f, void *ud)
 	struct kretprobe *kr = (struct kretprobe *)ud;
 	struct kretprobe_instance ri;
 	struct pt_regs r;
-	if (!f->local.data[7] || !kr->handler) return;
-	ri.data = f->local.data;
+	if (!F_FLAG || !kr->handler) return;
+	ri.data = F_BODY;
 	regs_in(&r, f);
 	P_RET(&r) = f->ret;
 	kr->handler(&ri, &r);
@@ -436,7 +427,7 @@ static int register_kretprobe(struct kretprobe *kr)
 {
 	unsigned long addr;
 	if (!kr->kp.symbol_name) return -EINVAL;
-	if (kr->data_size > 48) return -E2BIG;
+	if (kr->data_size > 40) return -E2BIG;
 	addr = kallsyms_lookup_name(kr->kp.symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", kr->kp.symbol_name); return -ESRCH; }
 	kr->kp.addr = (void *)addr;
@@ -840,11 +831,11 @@ static bool filter_actor_pid(struct kp_dir_context *c, const char *name, int nam
 
 static void dir_before(hook_fargs4_t *f, void *ud)
 {
-	struct shadow *s = (struct shadow *)f->local.data;
+	struct shadow *s = (struct shadow *)F_BODY;
 	struct kp_dir_context *ctx = (struct kp_dir_context *)f->arg1;
 	int pidonly = (int)(unsigned long)ud;
 
-	f->local.data[7] = 0;
+	F_FLAG = 0;
 	if (bypass() || !kptr_ok(ctx) || !kptr_ok((const void *)ctx->actor)) return;
 	if ((void *)ctx->actor == (void *)filter_actor) return;
 	if (pidonly && !hide_pid) return;
@@ -854,14 +845,14 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	s->dc.actor = pidonly ? filter_actor_pid : filter_actor;
 	s->pidonly = pidonly;
 	f->arg1 = (unsigned long)&s->dc;
-	f->local.data[7] = 1;
+	F_FLAG = 1;
 }
 
 static void dir_after(hook_fargs4_t *f, void *ud)
 {
-	struct shadow *s = (struct shadow *)f->local.data;
+	struct shadow *s = (struct shadow *)F_BODY;
 	(void)ud;
-	if (!f->local.data[7]) return;
+	if (!F_FLAG) return;
 	s->orig->pos = s->dc.pos;
 }
 
@@ -894,9 +885,9 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	char __user *ub = (char __user *)P_ARG1(regs);
 	long ret = (long)regs_return_value(regs);
 	int mode = *(int *)ri->data;
-	char buf[768];
+	char buf[512];
 	long n;
-	if (!mode || ret <= 0 || !ub) return 0;
+	if (!mode || ret <= 0 || !user_ok((unsigned long)ub)) return 0;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
 	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
@@ -947,7 +938,7 @@ static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 	long ret = (long)regs_return_value(regs);
 	char buf[64];
 	long n;
-	if (!*(int *)ri->data || ret <= 0 || !ub) return 0;
+	if (!*(int *)ri->data || ret <= 0 || !user_ok((unsigned long)ub)) return 0;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
 	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
@@ -968,7 +959,8 @@ static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct kp_seq_file *m = (struct kp_seq_file *)P_ARG0(regs);
 	d->m = m; d->saved = 0; d->maps = 0;
 	if (bypass() || !kptr_ok(m) || !kptr_ok(m->buf)) return 0;
-	if (m->size < m->count || m->size > 0x100000) return 0;
+	if (m->size < 64 || m->size > 0x100000) return 0;
+	if (m->count > m->size) return 0;
 	d->saved = (long)m->count;
 	return 1;
 }
@@ -1011,6 +1003,7 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	long i, o, end;
 	(void)regs;
 	if (!d->saved || !kptr_ok(m) || (long)m->count <= d->saved) return 0;
+	if ((unsigned long)m->count > m->size) return 0;
 	zero_tracer(m->buf, d->saved, (long)m->count);
 	if (d->maps) defang_perms(m->buf, d->saved, (long)m->count);
 	i = d->saved; end = (long)m->count; o = d->saved;
@@ -1222,6 +1215,10 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	memset(&cm, 0, sizeof(cm));
 
 	if (cmd == OP_INIT) return 0;
+
+	/* galat slot se aaya call bhi safe rahe */
+	if (!user_ok(arg)) return -EINVAL;
+
 	if (cmd == OP_VER) {
 		int v = (API_VER << 16) | (int)hooks_ok;
 		return copy_to_user((void __user *)arg, &v, sizeof(v)) ? -EFAULT : 0;
@@ -1264,7 +1261,7 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 #endif
 		} else if (copy_from_user(&mb, (void __user *)arg, sizeof(mb))) return -EFAULT;
 
-		if (!mb.pid || !mb.name) return -EINVAL;
+		if (!mb.pid || !mb.name || !user_ok((unsigned long)mb.name)) return -EINVAL;
 		if (strncpy_from_user(pname, (const char __user *)(unsigned long)mb.name,
 				      sizeof(pname) - 1) < 0) return -EFAULT;
 		pname[sizeof(pname) - 1] = '\0';
@@ -1300,7 +1297,8 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		return 0;
 	}
 
-	if (!cm.pid || !cm.size || cm.size > MAX_IO || !cm.addr || !cm.buffer) return -EINVAL;
+	if (!cm.pid || !cm.size || cm.size > MAX_IO) return -EINVAL;
+	if (!user_ok((unsigned long)cm.addr) || !user_ok((unsigned long)cm.buffer)) return -EINVAL;
 	tsk = task_get(cm.pid);
 	if (!tsk) return -ESRCH;
 	if (!k_access_process_vm) { task_put(tsk); return -EIO; }
@@ -1346,6 +1344,7 @@ KPM_CTL0(owner_ctl);
 static long nvsvc_start(const char *args, const char *event, void *__user reserved)
 {
 	unsigned int maj = 0, min = 0;
+	unsigned int off;
 	int r;
 	(void)args; (void)event; (void)reserved;
 
@@ -1367,16 +1366,15 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 		return -EINVAL;
 	}
 
-	r = fops_offsets(maj, min);
-	if (r) { pr_info("nvsvc: fops offset resolve fail\n"); return r; }
+	fops_guess(maj, min);
 
+	/* HAR slot dev_ioctl -> offset galat ho to bhi kuch nahi tootega.
+	 * slot 0 (owner) NULL rehta hai warna try_module_get crash karega. */
 	memset(fops_buf, 0, sizeof(fops_buf));
-	fops_put((unsigned int)sizeof(void *), (const void *)k_no_llseek);
-	fops_put(uio_off, (const void *)dev_ioctl);
-#ifdef CONFIG_COMPAT
-	fops_put(cio_off, (const void *)dev_ioctl);
-#endif
-	pr_info("nvsvc: kernel %u.%u uio=%u cio=%u\n", maj, min, uio_off, cio_off);
+	for (off = sizeof(void *); off + sizeof(void *) <= FOPS_MAX; off += sizeof(void *))
+		fops_put(off, (const void *)dev_ioctl);
+	if (k_no_llseek) fops_put((unsigned int)sizeof(void *), (const void *)k_no_llseek);
+	pr_info("nvsvc: kernel %u.%u guess uio=%u\n", maj, min, uio_off);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
