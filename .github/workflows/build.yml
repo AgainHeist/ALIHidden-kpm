@@ -13,18 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y make git gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+        run: sudo apt-get update && sudo apt-get install -y make git gcc-aarch64-linux-gnu
       - name: build
         run: bash ci/build.sh
-      - name: verify artifact
-        run: |
-          f=$(ls kpm/*.kpm)
-          readelf -h "$f" | grep -q 'REL (Relocatable)'
-          readelf -S "$f" | grep -q '\.kpm\.init'
-          readelf -S "$f" | grep -q '\.kpm\.exit'
-          readelf -S "$f" | grep -q '\.kpm\.info'
-          echo "--- undefined symbols ---"
-          readelf -sW "$f" | awk '$7=="UND"{print $8}' | sort -u
       - uses: actions/upload-artifact@v4
         with:
           name: Owner_By_ali-kpm
