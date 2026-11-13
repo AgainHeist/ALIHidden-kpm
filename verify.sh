@@ -1,5 +1,4 @@
 #!/system/bin/sh
-# root se mat chalao -- root ab bypass karta hai (strict=0)
 P=0; F=0
 ck() {
   r=$(eval "$2" 2>&1)
@@ -9,10 +8,13 @@ ck() {
 
 ck "su hidden"         "ls /system/bin | grep -c '^su$'"                   "0"
 ck "magisk hidden"     "ls /system/bin | grep -c '^magisk$'"               "0"
+ck "kp hidden"         "ls /system/bin | grep -c '^kp$'"                   "0"
 ck "adb hidden"        "ls /data | grep -c '^adb$'"                        "0"
 ck "tmp hidden"        "ls -d /data/local/tmp 2>/dev/null | wc -l"         "0"
 ck "nvsvc /dev"        "ls /dev | grep -c '^nvsvc$'"                       "0"
 ck "dev openable"      "ls -l /dev/nvsvc >/dev/null 2>&1; echo \$?"        "0"
+ck "kpatch moddir"     "ls /sys/module | grep -c '^kpatch$'"               "0"
+ck "zygisk hidden"     "ls /data/adb/modules 2>/dev/null | grep -c zygisk" "0"
 ck "bootstate"         "grep -o 'verifiedbootstate=[a-z]*' /proc/cmdline"  "verifiedbootstate=green"
 ck "flash locked"      "grep -o 'flash.locked=[01]' /proc/cmdline"         "flash.locked=1"
 ck "vbmeta locked"     "grep -o 'vbmeta.device_state=[a-z]*' /proc/cmdline" "vbmeta.device_state=locked"
@@ -29,6 +31,7 @@ ck "tags"              "getprop ro.build.tags"                             "rele
 ck "config.gz hidden"  "ls /proc/config.gz 2>&1 | grep -c 'No such'"       "1"
 ck "kpatch token"      "grep -c kpatch /proc/version"                      "1"
 ck "mgr uid"           "dmesg | grep -c 'nvsvc: mgr uid'"                  "1"
+ck "game uid"          "dmesg | grep -c 'nvsvc: game uid'"                 "1"
 ck "owner tag"         "dmesg | grep -c 'nvsvc: Owner By ali'"             "1"
 ck "hooks live"        "dmesg | grep -c 'nvsvc: loaded'"                   "1"
 
