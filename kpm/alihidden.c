@@ -1,9 +1,12 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v11  LOAD-SAFE
-//  Owner tag: XOR-encoded + checksum-locked
-//  Kernel 3.18 - 7.x (arm64 / x86_64)
-//  v11: load-fail fixes -- kretprobe E2BIG, hook_tr clobber,
-//       non-fatal version/misc/hook gates, open slot, kallsyms include
+//  DARKxKERNEL KPM  (nvsvc)  v12  LOAD-SAFE
+//  v12 fixes:
+//   - BTI: build me -mbranch-protection=standard MUST
+//   - fops offset math galat tha (>=4.16 me poll slot hit ho raha tha)
+//   - CONFIG_COMPAT KPM build me define nahi hota -> compat
+//     detection runtime (in_compat_syscall kallsyms se)
+//   - uts / cmdline layout sanity gate (randstruct se bachav)
+//   - cmd_end dangling pointer fix
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -23,22 +26,10 @@
 #    include <kputils.h>
 #    define KP_HAVE_UTILS 1
 #  endif
-#  if __has_include(<linux/compat.h>)
-#    include <linux/compat.h>
-#    define KP_HAVE_COMPAT_H 1
-#  endif
 #endif
 
-/* kallsyms_lookup_name KP me function-pointer VARIABLE hai (kallsyms.h),
- * isliye khud extern declare nahi karna -- warna redeclare error deta hai.
- * Sirf current_uid ko guard karna hai jab kputils.h na mile. */
 #ifndef KP_HAVE_UTILS
 extern unsigned int current_uid(void);
-#endif
-#ifdef CONFIG_COMPAT
-#  ifndef KP_HAVE_COMPAT_H
-extern int in_compat_syscall(void);
-#  endif
 #endif
 
 #ifndef STAGE
@@ -66,7 +57,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("10.1.0");
+KPM_VERSION("11.1.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -137,7 +128,7 @@ KPM_DESCRIPTION("system service");
 #endif
 
 /* ============================================================
- *  KERNEL STRUCT SHIMS (3.18 - 7.x) -- sab kp_ prefixed
+ *  KERNEL STRUCT SHIMS
  * ============================================================ */
 struct module;
 struct inode;
@@ -159,14 +150,7 @@ struct kp_dentry {
 };
 
 struct kp_path { struct vfsmount *mnt; struct kp_dentry *dentry; };
-
-/* f_u (llist/rcu_head union) = 16 byte, f_path uske BAAD */
-struct kp_file {
-	void *f_u[2];
-	struct kp_path f_path;
-};
-
-/* kernel ka struct filename -> pehla field hi name hai */
+struct kp_file { void *f_u[2]; struct kp_path f_path; };
 struct kp_filename { const char *name; };
 
 struct kp_dir_context;
@@ -201,9 +185,7 @@ struct kp_miscdevice {
 };
 
 struct kp_seq_file { char *buf; size_t size; size_t from; size_t count; };
-
 struct kp_statfs { long f_type; long f_bsize; };
-
 struct kp_mm;
 
 struct kp_vma {
@@ -255,6 +237,7 @@ static void (*k_kvfree)(void *);
 static int  (*k_access_process_vm)(struct task_struct *, unsigned long, void *, int, int);
 static loff_t (*k_no_llseek)(struct kp_file *, loff_t, int);
 static int  (*k_copy_from_user)(void *, const void __user *, unsigned long);
+static int  (*k_in_compat)(void);          /* FIX v12 */
 static int  *k_kptr_restrict;
 static char **k_saved_cmdline;
 static struct kp_utsns *k_uts;
@@ -277,7 +260,7 @@ static int user_ok(unsigned long a)
 }
 
 /* ============================================================
- *  fops buffer: HAR slot dev_ioctl  (owner slot NULL rehta hai)
+ *  fops buffer
  * ============================================================ */
 #define FOPS_MAX 384
 static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
@@ -285,19 +268,20 @@ static unsigned int uio_off, cio_off;
 
 static void fops_put(unsigned int off, const void *fn)
 {
-	if (off && off + sizeof(void *) <= FOPS_MAX)
+	if (off + sizeof(void *) <= FOPS_MAX)
 		*(const void **)(fops_buf + off) = fn;
 }
 
-/* sirf log ke liye; galat ho to bhi koi nuksan nahi */
-static void fops_guess(unsigned int maj, unsigned int min)
+/* FIX v12: sahi offsets.
+ * < 4.7  : unlocked_ioctl = idx 8, compat_ioctl = idx 9
+ * >= 4.7 : (aio_read/write -> read_iter/write_iter, iterate_shared,
+ *           phir iopoll) unlocked_ioctl = idx 10, compat_ioctl = idx 11
+ * v11 ka >=7 -> idx 9 galat tha: wo poll slot hai. */
+static void fops_layout(unsigned int maj, unsigned int min)
 {
-	unsigned int idx;
-	if (maj >= 7) idx = 9;
-	else if (maj == 6) idx = (min >= 6) ? 9 : 10;
-	else if (maj == 5) idx = (min == 0) ? 9 : 10;
-	else if (maj == 4) idx = (min >= 7) ? 9 : 8;
-	else idx = 8;
+	unsigned long v = (unsigned long)maj * 100 + min;
+	unsigned int idx = (v >= 407) ? 10 : 8;
+
 	uio_off = idx * (unsigned int)sizeof(void *);
 	cio_off = uio_off + (unsigned int)sizeof(void *);
 }
@@ -331,12 +315,9 @@ struct kretprobe {
 #define regs_return_value(r) P_RET(r)
 #endif
 
-/* local.data[0] = flag, shadow/data data[1] se shuru */
 #define F_FLAG f->local.data[0]
 #define F_BODY ((void *)(f->local.data + 1))
 
-/* hook_local.data[] = 8 * 8 = 64 byte; data[0] flag ke liye,
- * body ke liye 56 byte bachte hain -- isse zyada mat maango. */
 #define KRET_BODY_MAX 56
 
 #if defined(__aarch64__)
@@ -496,10 +477,8 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 
 struct copy_mem { int pid; unsigned int pad; unsigned long long addr, buffer, size; };
 struct mod_base { int pid; unsigned int pad; unsigned long long name, base; };
-#ifdef CONFIG_COMPAT
 struct copy_mem32 { int pid; unsigned int addr, buffer, size; };
 struct mod_base32 { int pid; unsigned int name, base; };
-#endif
 
 static char saved_release[__NEW_UTS_LEN + 1];
 static char saved_version[__NEW_UTS_LEN + 1];
@@ -636,13 +615,36 @@ static int uts_marked(const char *s)
 	return 0;
 }
 
+/* FIX v12: randstruct / layout mismatch gate.
+ * Sirf "Linux" check kaafi nahi tha -- release me digit+dot aur
+ * version me printable hona chahiye, warna scrub hi skip. */
+static int uts_layout_ok(void)
+{
+	const char *r, *v;
+	unsigned int i, digits = 0;
+
+	if (!kptr_ok(k_uts)) return 0;
+	if (strncmp(k_uts->name.sysname, "Linux", 5)) return 0;
+
+	r = k_uts->name.release;
+	v = k_uts->name.version;
+
+	for (i = 0; i < __NEW_UTS_LEN && r[i]; i++)
+		if (r[i] >= '0' && r[i] <= '9') digits++;
+	if (!digits || !strchr(r, '.')) return 0;
+	if (!v[0]) return 0;
+	for (i = 0; i < __NEW_UTS_LEN && v[i]; i++)
+		if ((unsigned char)v[i] < 0x20 || (unsigned char)v[i] > 0x7e) return 0;
+
+	return 1;
+}
+
 static void uts_scrub(void)
 {
 	char *r, *v, *c;
 
-	if (!kptr_ok(k_uts)) return;
-	if (strncmp(k_uts->name.sysname, "Linux", 5)) {
-		pr_info("nvsvc: uts shim mismatch, skip\n");
+	if (!uts_layout_ok()) {
+		pr_info("nvsvc: uts layout mismatch, skip\n");
 		return;
 	}
 	r = k_uts->name.release;
@@ -743,12 +745,16 @@ static void scrub_boot_args(char *c)
 	set_bootstate(c); set_locked(c); set_vbmeta(c); set_verity(c); set_selinux(c);
 }
 
+/* FIX v12: cmdline layout gate + cmd_end reset */
 static void cmdline_scrub(void)
 {
 	char *c;
+
+	cmd_end = NULL;
 	if (!k_saved_cmdline || !kptr_ok(k_saved_cmdline)) return;
 	c = *k_saved_cmdline;
 	if (!c || !kptr_ok(c)) return;
+	if (!strstr(c, "androidboot")) return;
 	cmd_end = c + strlen(c);
 	scrub_boot_args(c);
 }
@@ -905,7 +911,7 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (copy_from_user(buf, ub, n)) return 0;
 	buf[n] = '\0';
 	switch (mode) {
-	case 1: cmd_end = buf + n; scrub_boot_args(buf); break;
+	case 1: cmd_end = buf + n; scrub_boot_args(buf); cmd_end = NULL; break;
 	case 2: scrub_buildprop(buf); break;
 	case 3: scrub_ctx(buf); break;
 	case 4: if (buf[0] == '0') buf[0] = '1'; break;
@@ -1031,8 +1037,6 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-/* entry_handler/handler pehle se set ho to unhe chhedo mat --
- * varna pre_read/post_read jaise custom handlers kho jate hain. */
 static void hook_tr(struct kretprobe *kr, const char *sym, int maps)
 {
 	kr->kp.symbol_name = sym;
@@ -1168,6 +1172,7 @@ static int resolve_syms(void)
 	RS("kptr_restrict", k_kptr_restrict);
 	RS("saved_command_line", k_saved_cmdline);
 	RS("init_uts_ns", k_uts);
+	RS("in_compat_syscall", k_in_compat);        /* FIX v12 */
 	RS("misc_register", k_misc_register);
 	RS("misc_deregister", k_misc_deregister);
 	RS("kern_path", k_kern_path);
@@ -1182,8 +1187,6 @@ static int resolve_syms(void)
 	RS("kvfree", k_kvfree);
 	RS("access_process_vm", k_access_process_vm);
 	RS("no_llseek", k_no_llseek);
-	/* sirf copy_from_user mandatory; misc_* / uts / cmdline optional --
-	 * inke bina bhi hooks chal sakte hain, load fail nahi hona chahiye. */
 	if (!k_copy_from_user) return -ESRCH;
 	return 0;
 }
@@ -1202,7 +1205,6 @@ static void task_put(struct task_struct *t) { if (t && k_put_task_struct) k_put_
 
 static void wb_size(unsigned long arg, int c32, unsigned long long sz)
 {
-#ifdef CONFIG_COMPAT
 	if (c32) {
 		struct copy_mem32 x;
 		if (copy_from_user(&x, (void __user *)arg, sizeof(x))) return;
@@ -1210,7 +1212,6 @@ static void wb_size(unsigned long arg, int c32, unsigned long long sz)
 		copy_to_user((void __user *)arg, &x, sizeof(x));
 		return;
 	}
-#endif
 	{
 		struct copy_mem x;
 		if (copy_from_user(&x, (void __user *)arg, sizeof(x))) return;
@@ -1227,15 +1228,12 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	char small[SMALL_IO];
 	int ret, c32 = 0;
 	(void)f;
-#ifdef CONFIG_COMPAT
-	c32 = in_compat_syscall();
-#endif
+
+	if (k_in_compat) c32 = k_in_compat() ? 1 : 0;
 	memset(&cm, 0, sizeof(cm));
 
 	if (cmd == OP_INIT) return 0;
 
-	/* open()/release() me arg garbage hota hai. Isliye not-a-user-pointer
-	 * par -EINVAL nahi, 0 return karo -- warna /dev/nvsvc open hi fail. */
 	if (!user_ok(arg)) return 0;
 
 	if (cmd == OP_VER) {
@@ -1256,11 +1254,9 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	}
 
 	if (c32) {
-#ifdef CONFIG_COMPAT
 		struct copy_mem32 x;
 		if (copy_from_user(&x, (void __user *)arg, sizeof(x))) return -EFAULT;
 		cm.pid = x.pid; cm.addr = x.addr; cm.buffer = x.buffer; cm.size = x.size;
-#endif
 	} else if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
 
 	if (cmd == OP_BASE) {
@@ -1273,11 +1269,9 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 
 		memset(&mb, 0, sizeof(mb));
 		if (c32) {
-#ifdef CONFIG_COMPAT
 			struct mod_base32 y;
 			if (copy_from_user(&y, (void __user *)arg, sizeof(y))) return -EFAULT;
 			mb.pid = y.pid; mb.name = y.name;
-#endif
 		} else if (copy_from_user(&mb, (void __user *)arg, sizeof(mb))) return -EFAULT;
 
 		if (!mb.pid || !mb.name || !user_ok((unsigned long)mb.name)) return -EINVAL;
@@ -1307,11 +1301,9 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		mb.base = found;
 
 		if (c32) {
-#ifdef CONFIG_COMPAT
 			struct mod_base32 y;
 			y.pid = mb.pid; y.name = (unsigned int)mb.name; y.base = (unsigned int)found;
 			copy_to_user((void __user *)arg, &y, sizeof(y));
-#endif
 		} else copy_to_user((void __user *)arg, &mb, sizeof(mb));
 		return 0;
 	}
@@ -1377,25 +1369,27 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
 
 	if (kver_mm(&maj, &min)) {
-		/* init_uts_ns data symbol hai -> KALLSYMS_ALL off par nahi milega.
-		 * fops_guess sirf cosmetic hai, isliye default maan ke aage badho. */
 		maj = 5; min = 10;
 		pr_info("nvsvc: version unknown, assuming %u.%u\n", maj, min);
 	} else if (maj < 3 || (maj == 3 && min < 18)) {
-		pr_info("nvsvc: kernel %u.%u bahut purana (3.18+ chahiye)\n", maj, min);
+		pr_info("nvsvc: kernel %u.%u bahut purana\n", maj, min);
 		return -EINVAL;
 	}
 
-	fops_guess(maj, min);
+	fops_layout(maj, min);
 
-	/* HAR slot dev_ioctl -> offset galat ho to bhi kuch nahi tootega.
-	 * slot 0 (owner) NULL rehta hai warna try_module_get crash karega.
-	 * open/release bhi dev_ioctl hi hain, isliye dev_ioctl arg par 0 deta hai. */
 	memset(fops_buf, 0, sizeof(fops_buf));
+	/* fill-all: unknown slot par bhi dev_ioctl -- offset galat ho to bhi
+	 * kuch nahi tootega, kyunki dev_ioctl garbage arg par 0 deta hai.
+	 * slot 0 (owner) NULL rehta hai, warna try_module_get crash. */
 	for (off = sizeof(void *); off + sizeof(void *) <= FOPS_MAX; off += sizeof(void *))
 		fops_put(off, (const void *)dev_ioctl);
-	if (k_no_llseek) fops_put((unsigned int)sizeof(void *), (const void *)k_no_llseek);
-	pr_info("nvsvc: kernel %u.%u guess uio=%u\n", maj, min, uio_off);
+	/* FIX v12: exact ioctl slots + llseek */
+	fops_put(uio_off, (const void *)dev_ioctl);
+	fops_put(cio_off, (const void *)dev_ioctl);
+	fops_put((unsigned int)sizeof(void *),
+		 (const void *)(k_no_llseek ? k_no_llseek : dev_ioctl));
+	pr_info("nvsvc: kernel %u.%u ioctl_off=%u\n", maj, min, uio_off);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
