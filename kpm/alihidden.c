@@ -1,14 +1,14 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v2
-//  Userspace protocol: /dev/nvsvc  ->  DarkXKernal KernelTools.cpp
-//  Strict hiding, default ON. Kernel 5.4 - 6.1 (arm64 / x86_64)
+//  DARKxKERNEL KPM  (nvsvc)  v3
+//  Owner tag: XOR-encoded + checksum-locked (tamper proof)
+//  Userspace protocol: /dev/nvsvc -> DarkXKernal
+//  Kernel 5.4 - 6.1 (arm64 / x86_64)
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
 #include <stdbool.h>
 #include <common.h>
 #include <kpmodule.h>
-#include <kputils.h>
 #include <hook.h>
 #include <linux/printk.h>
 #include <linux/string.h>
@@ -16,14 +16,56 @@
 #include <linux/ptrace.h>
 #include <linux/uaccess.h>
 
+/* ---- KP header compat (kputils.h naye KP se hata hai) ---- */
+#if defined(__has_include)
+#  if __has_include(<kputils.h>)
+#    include <kputils.h>
+#    define KP_HAVE_UTILS 1
+#  endif
+#  if __has_include(<linux/compat.h>)
+#    include <linux/compat.h>
+#    define KP_HAVE_COMPAT_H 1
+#  endif
+#endif
+
+#ifndef KP_HAVE_UTILS
+extern void *kallsyms_lookup_name(const char *name);
+extern unsigned int current_uid(void);
+#endif
+#ifdef CONFIG_COMPAT
+#  ifndef KP_HAVE_COMPAT_H
+extern int in_compat_syscall(void);
+#  endif
+#endif
+
 #ifndef KPM
 #define KPM 1
 #endif
 
-KPM_NAME("nvsvc");
-KPM_VERSION("2.0.0");
+/* ============================================================
+ *  OWNER TAG  (binary se naam badla to load hi nahi hoga)
+ * ============================================================ */
+#define NAME_KEY 0x5A
+#define NAME_SUM 0x1B25
+static const unsigned char name_enc[] = {
+	0x15, 0x2D, 0x34, 0x3F, 0x28, 0x7A, 0x18, 0x23, 0x7A, 0x3B, 0x36, 0x33, 0x5A
+};
+static char owner_name[24];
+
+static int name_decode(void)
+{
+	unsigned int i, s = 0;
+	for (i = 0; i < sizeof(name_enc); i++)
+		owner_name[i] = (char)(name_enc[i] ^ NAME_KEY);
+	for (i = 0; owner_name[i]; i++)
+		s += (unsigned int)owner_name[i] * (i + 1);
+	return s == NAME_SUM;
+}
+
+KPM_NAME("Owner By ali");
+KPM_VERSION("3.0.0");
 KPM_LICENSE("GPL");
-KPM_AUTHOR("DarkXKernel");
+KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
 
 #ifndef EFAULT
@@ -90,7 +132,7 @@ KPM_DESCRIPTION("system service");
 #endif
 
 /* ============================================================
- *  KERNEL STRUCT SHIMS  (5.4 - 6.1 layouts, corrected)
+ *  KERNEL STRUCT SHIMS  (5.4 - 6.1 layouts)
  * ============================================================ */
 struct module;
 struct inode;
@@ -99,6 +141,7 @@ struct pid;
 struct task_struct;
 struct anon_vma;
 struct vm_operations_struct;
+struct cred;
 
 struct qstr { unsigned int hash; unsigned int len; const unsigned char *name; };
 struct hlist_bl_node { struct hlist_bl_node *next, **pprev; };
@@ -134,7 +177,6 @@ struct file_operations {
 	long (*compat_ioctl)(struct file *, unsigned int, unsigned long);
 };
 
-/* FIX #1: nodename wapas, warna misc_register 0x1B6 deref karke panic karta hai */
 struct miscdevice {
 	int minor;
 	const char *name;
@@ -151,7 +193,6 @@ struct seq_file { char *buf; size_t size; size_t from; size_t count; };
 
 struct kstatfs { long f_type; long f_bsize; };
 
-/* FIX #4: poora 5.4-6.1 vm_area_struct, vm_file ab sahi offset par */
 struct vm_area_struct {
 	unsigned long vm_start;
 	unsigned long vm_end;
@@ -172,7 +213,6 @@ struct vm_area_struct {
 
 struct mm_struct { struct vm_area_struct *mmap; };
 
-/* FIX #3: uts_namespace ke shuru mein struct kref (4 byte) hota hai */
 #define __NEW_UTS_LEN 64
 struct kp_utsname {
 	char sysname[__NEW_UTS_LEN + 1];
@@ -317,8 +357,8 @@ static void kret_after(hook_fargs4_t *f, void *ud)
 static int register_kprobe(struct kprobe *p)
 {
 	unsigned long addr;
-	if (!p->symbol_name || !kallsyms_lookup_name) return -EINVAL;
-	addr = kallsyms_lookup_name(p->symbol_name);
+	if (!p->symbol_name) return -EINVAL;
+	addr = (unsigned long)kallsyms_lookup_name(p->symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", p->symbol_name); return -ESRCH; }
 	p->addr = (void *)addr;
 	if (hook_wrap4(p->addr, kprobe_before, kprobe_after, p)) { p->addr = 0; return -EIO; }
@@ -328,7 +368,7 @@ static int register_kprobe(struct kprobe *p)
 
 static void unregister_kprobe(struct kprobe *p)
 {
-	if (!p->hooked) return;
+	if (!p->hooked || !p->addr) return;
 	hook_unwrap(p->addr, kprobe_before, kprobe_after);
 	p->hooked = 0;
 }
@@ -336,9 +376,9 @@ static void unregister_kprobe(struct kprobe *p)
 static int register_kretprobe(struct kretprobe *kr)
 {
 	unsigned long addr;
-	if (!kr->kp.symbol_name || !kallsyms_lookup_name) return -EINVAL;
+	if (!kr->kp.symbol_name) return -EINVAL;
 	if (kr->data_size > 48) return -E2BIG;
-	addr = kallsyms_lookup_name(kr->kp.symbol_name);
+	addr = (unsigned long)kallsyms_lookup_name(kr->kp.symbol_name);
 	if (!addr) { pr_info("nvsvc: no sym %s\n", kr->kp.symbol_name); return -ESRCH; }
 	kr->kp.addr = (void *)addr;
 	if (hook_wrap4(kr->kp.addr, kret_before, kret_after, kr)) { kr->kp.addr = 0; return -EIO; }
@@ -348,7 +388,7 @@ static int register_kretprobe(struct kretprobe *kr)
 
 static void unregister_kretprobe(struct kretprobe *kr)
 {
-	if (!kr->hooked) return;
+	if (!kr->hooked || !kr->kp.addr) return;
 	hook_unwrap(kr->kp.addr, kret_before, kret_after);
 	kr->hooked = 0;
 }
@@ -409,6 +449,7 @@ static int  strict = 1;
 static int  hide_pid;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
+static unsigned long iterate_addr, piddir_addr;
 
 static int bypass(void) { return current_uid() == 0 && !strict; }
 
@@ -702,8 +743,6 @@ static void dir_after(hook_fargs4_t *f, void *ud)
 	s->orig->pos = s->dc.pos;
 }
 
-static struct kprobe kp_iter, kp_piddir;
-
 /* ---------- read scrub ---------- */
 static struct kretprobe kr_pread, kr_bprop;
 
@@ -885,14 +924,21 @@ static void hooks_install(void)
 		kp_path.pre_handler = pre_path;
 		if (!register_kprobe(&kp_path)) hooks_ok++;
 	}
-	kp_iter.symbol_name = "iterate_dir";
-	kp_iter.pre_handler = NULL;
-	if (!hook_wrap4((void *)kallsyms_lookup_name("iterate_dir"), dir_before, dir_after, (void *)0)) {
-		kp_iter.hooked = 1; hooks_ok++;
+
+	iterate_addr = (unsigned long)kallsyms_lookup_name("iterate_dir");
+	if (iterate_addr &&
+	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0)) {
+		hooks_ok++;
+	} else {
+		iterate_addr = 0;
 	}
-	if (kallsyms_lookup_name("proc_pid_readdir") &&
-	    !hook_wrap4((void *)kallsyms_lookup_name("proc_pid_readdir"), dir_before, dir_after, (void *)1)) {
-		kp_piddir.hooked = 1; hooks_ok++;
+
+	piddir_addr = (unsigned long)kallsyms_lookup_name("proc_pid_readdir");
+	if (piddir_addr &&
+	    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1)) {
+		hooks_ok++;
+	} else {
+		piddir_addr = 0;
 	}
 
 	kr_pread.data_size = sizeof(int);
@@ -904,20 +950,21 @@ static void hooks_install(void)
 	hook_tr(&kr_pread, "proc_reg_read", 0);
 	hook_tr(&kr_bprop, "vfs_read", 0);
 
-	/* FIX #2: symbol_name ab set hota hai */
 	kr_statfs.kp.symbol_name = "vfs_statfs";
 	kr_statfs.data_size = 0;
 	kr_statfs.entry_handler = entry_statfs;
 	kr_statfs.handler = post_statfs;
 	kr_statfs.maxactive = 64;
-	if (!register_kretprobe(&kr_statfs)) hooks_ok++; else memset(&kr_statfs, 0, sizeof(kr_statfs));
+	if (!register_kretprobe(&kr_statfs)) hooks_ok++;
+	else memset(&kr_statfs, 0, sizeof(kr_statfs));
 
 	kr_rl.kp.symbol_name = "vfs_readlink";
 	kr_rl.data_size = sizeof(int);
 	kr_rl.entry_handler = pre_rl;
 	kr_rl.handler = post_rl;
 	kr_rl.maxactive = 64;
-	if (!register_kretprobe(&kr_rl)) hooks_ok++; else memset(&kr_rl, 0, sizeof(kr_rl));
+	if (!register_kretprobe(&kr_rl)) hooks_ok++;
+	else memset(&kr_rl, 0, sizeof(kr_rl));
 
 	hook_tr(&kr_mounts, "show_vfsmnt", 0);
 	hook_tr(&kr_mountinfo, "show_mountinfo", 0);
@@ -935,8 +982,8 @@ static void hooks_remove(void)
 {
 	if (kr_name.hooked) unregister_kretprobe(&kr_name);
 	if (kp_path.hooked) unregister_kprobe(&kp_path);
-	if (kp_iter.hooked) hook_unwrap((void *)kallsyms_lookup_name("iterate_dir"), dir_before, dir_after);
-	if (kp_piddir.hooked) hook_unwrap((void *)kallsyms_lookup_name("proc_pid_readdir"), dir_before, dir_after);
+	if (iterate_addr) hook_unwrap((void *)iterate_addr, dir_before, dir_after);
+	if (piddir_addr) hook_unwrap((void *)piddir_addr, dir_before, dir_after);
 	if (kr_pread.hooked) unregister_kretprobe(&kr_pread);
 	if (kr_bprop.hooked) unregister_kretprobe(&kr_bprop);
 	if (kr_statfs.hooked) unregister_kretprobe(&kr_statfs);
@@ -966,12 +1013,11 @@ static void pick_fake_path(void)
 }
 
 /* ---------- symbols ---------- */
-#define RS(name, slot) do { *(void **)&(slot) = (void *)kallsyms_lookup_name(name); \
+#define RS(name, slot) do { *(void **)&(slot) = kallsyms_lookup_name(name); \
 	if (!(slot)) pr_info("nvsvc: missing %s\n", name); } while (0)
 
 static int resolve_syms(void)
 {
-	if (!kallsyms_lookup_name) return -ESRCH;
 	RS("_copy_from_user", k_copy_from_user);
 	if (!k_copy_from_user) RS("__arch_copy_from_user", k_copy_from_user);
 	RS("kptr_restrict", k_kptr_restrict);
@@ -1148,10 +1194,30 @@ static long dev_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 static struct file_operations dev_fops;
 static struct miscdevice dev;
 
+/* owner tag reader: kpatch kpm ctl "Owner By ali" */
+static long owner_ctl(const char *ctl_args, char __user *out_msg, int outlen)
+{
+	int n = 0;
+	(void)ctl_args;
+	if (!out_msg || outlen <= 0) return 0;
+	while (owner_name[n]) n++;
+	if (n > outlen) n = outlen;
+	return copy_to_user(out_msg, owner_name, n) ? -EFAULT : n;
+}
+
+KPM_CTL0(owner_ctl);
+
 static long nvsvc_start(const char *args, const char *event, void *__user reserved)
 {
 	int r;
 	(void)args; (void)event; (void)reserved;
+
+	/* tamper lock: encoded tag must match checksum */
+	if (!name_decode()) {
+		pr_info("nvsvc: owner tag tampered\n");
+		return -EIO;
+	}
+	pr_info("nvsvc: %s\n", owner_name);
 
 	r = resolve_syms();
 	if (r) { pr_info("nvsvc: resolve %d\n", r); return r; }
@@ -1167,16 +1233,28 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	dev.minor = MISC_DYNAMIC_MINOR;
 	dev.name = DEV_NAME;
 	dev.fops = &dev_fops;
-	dev.mode = 0666;         /* ab sahi offset par -> node 0666 banta hai */
+	dev.mode = 0666;
 
 	pick_fake_path();
+
 	r = k_misc_register(&dev);
 	if (r) { pr_info("nvsvc: misc_register %d\n", r); return r; }
 
 	if (k_uts) uts_scrub();
 	cmdline_scrub();
 	if (k_kptr_restrict) { saved_kptr = *k_kptr_restrict; *k_kptr_restrict = 2; }
+
 	hooks_install();
+
+	if (!hooks_ok) {
+		/* kuch bhi hook nahi laga -> safai karke fail */
+		if (k_kptr_restrict) *k_kptr_restrict = saved_kptr;
+		if (k_uts) uts_restore();
+		k_misc_deregister(&dev);
+		pr_info("nvsvc: no hooks, aborted\n");
+		return -EIO;
+	}
+
 	inited = 1;
 	pr_info("nvsvc: loaded, %u hooks\n", hooks_ok);
 	return 0;
@@ -1186,11 +1264,11 @@ static long nvsvc_stop(void *__user reserved)
 {
 	(void)reserved;
 	if (!inited) return 0;
+	inited = 0;
 	hooks_remove();
 	if (k_kptr_restrict) *k_kptr_restrict = saved_kptr;
 	if (k_uts) uts_restore();
 	if (k_misc_deregister) k_misc_deregister(&dev);
-	inited = 0;
 	return 0;
 }
 
