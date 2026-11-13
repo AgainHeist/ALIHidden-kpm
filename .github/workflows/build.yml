@@ -1,13 +1,29 @@
 name: build-kpm
-on: [push, workflow_dispatch]
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      kp_ref:
+        description: "KernelPatch tag/commit (APatch version se match karo)"
+        default: "main"
+      stage:
+        description: "STAGE 2-6 (panic aaye to kam karo)"
+        default: "6"
 
 jobs:
   kpm:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y make git gcc-aarch64-linux-gnu
+      - run: sudo apt-get update && sudo apt-get install -y make git gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
       - run: bash ci/build.sh
+        env:
+          KP_REF: ${{ github.event.inputs.kp_ref || 'main' }}
+      - run: make -C kpm clean all KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu- STAGE=${{ github.event.inputs.stage || 6 }}
+      - run: |
+          readelf -h kpm/Owner_By_ali.kpm | grep -q 'REL (Relocatable file)' && echo "ET_REL OK"
+          readelf -S kpm/Owner_By_ali.kpm | grep -q '\.kpm.init' && echo "init OK"
+          readelf -S kpm/Owner_By_ali.kpm | grep -q '\.kpm.info' && echo "info OK"
       - uses: actions/upload-artifact@v4
         with:
           name: Owner_By_ali-kpm
