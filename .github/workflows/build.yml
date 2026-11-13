@@ -6,17 +6,25 @@ on:
 jobs:
   kpm:
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        bti: ["0", "1"]
     env:
       KP_REF: "0.13.1"
       STAGE: "5"
-      BTI: "0"
+      BTI: "${{ matrix.bti }}"
     steps:
       - uses: actions/checkout@v4
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y make git gcc-aarch64-linux-gnu
       - name: build
         run: bash ci/build.sh
+      - name: rename
+        run: |
+          mkdir -p art
+          cp dist/alihidden.kpm "art/alihidden-bti${{ matrix.bti }}.kpm"
       - uses: actions/upload-artifact@v4
         with:
-          name: Owner_By_ali-kpm
-          path: "**/*.kpm"
+          name: alihidden-bti${{ matrix.bti }}
+          path: art/*.kpm
