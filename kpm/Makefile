@@ -4,8 +4,8 @@ endif
 ifndef KP_DIR
     KP_DIR = ../kp
 endif
-STAGE ?= 6
-BTI ?= 1
+STAGE ?= 5
+BTI ?= 0
 
 CC = $(TARGET_COMPILE)gcc
 CFLAGS += -nostdinc -fno-pic -fno-PIC -fno-pie -fno-stack-protector
