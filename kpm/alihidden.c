@@ -1,10 +1,12 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v14  APATCH-COMPAT
-//  v14:
-//   - default strict=0 -> root bypass (APatch kp/kpatchd kaam kare)
-//   - manager uid whitelist + auto-detect (inode uid se)
-//   - kptr_restrict = 1 (2 root se bhi chhupa deta tha)
-//   - version me "kpatch" token force (Full mode detect)
+//  DARKxKERNEL KPM  (nvsvc)  v16  FULL-HIDE
+//  v16:
+//   - game bypass OFF by default -> Free Fire ko bhi poora hide
+//     (OP_GBYP se zarurat pade to bypass on kar sakte ho)
+//   - pre_read me qstr len prefilter -> har read par 1 load,
+//     game ke read path par koi jank/crash nahi
+//   - zygisk / kp / init.kpatch.rc bhi hidden
+//   - OP_FLUSH: panel multi-write ke baad ek baar flush kar sake
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -55,7 +57,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("13.0.0");
+KPM_VERSION("15.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -235,6 +237,7 @@ static void *(*k_kvmalloc)(unsigned long, int);
 static void (*k_kvfree)(void *);
 static int  (*k_access_process_vm)(struct task_struct *, unsigned long, void *, int, int);
 static loff_t (*k_no_llseek)(struct kp_file *, loff_t, int);
+static void (*k_flush_icache)(unsigned long, unsigned long);
 static int  (*k_copy_from_user)(void *, const void __user *, unsigned long);
 static int  (*k_in_compat)(void);
 static int  *k_kptr_restrict;
@@ -463,7 +466,11 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_ABI     0x807
 #define OP_UTS     0x808
 #define OP_MUID    0x809
-#define API_VER    6
+#define OP_GUID    0x80A
+#define OP_GBYP    0x80B
+#define OP_OFF     0x80C
+#define OP_FLUSH   0x80D
+#define API_VER    8
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -488,19 +495,23 @@ static int  uts_ok;
 static int  strict;          /* 0 = root bypass (default), 1 = strict, 2 = off */
 static int  hide_pid;
 static int  mgr_uid = -1;
+static int  game_uid = -1;
+static int  game_byp;        /* default 0: game ko bhi poora hide */
+static int  hooks_off;
 static int  abi_force = -1;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
 static unsigned long iterate_addr, piddir_addr;
 static char *cmd_end;
 
-/* root + manager app bypass, taaki APatch ka kp/kpatchd kaam kare */
+/* root + manager bypass (game sirf tab jab game_byp on ho) */
 static int bypass(void)
 {
 	unsigned int u;
 	if (strict == 2) return 1;
 	u = current_uid();
 	if (u == 0) return strict ? 0 : 1;
+	if (game_byp && game_uid > 0 && (int)u == game_uid) return 1;
 	return mgr_uid > 0 && (int)u == mgr_uid;
 }
 
@@ -508,9 +519,9 @@ static const char *const hidden[] = {
 	"/data/adb", "/sbin/su", "/system/bin/su", "/system/xbin/su",
 	"/vendor/bin/su", "/system/bin/.ext", "/debug_ramdisk",
 	"/sbin/.magisk", "/system/bin/magisk", "/system/bin/ksud",
-	"/system/bin/apd", "/system/etc/init/magisk",
-	"/system/etc/init/init.magisk.rc", "/system/app/Magisk",
-	"/cache/magisk.log", "/data/magisk",
+	"/system/bin/apd", "/system/bin/kp", "/system/etc/init/magisk",
+	"/system/etc/init/init.magisk.rc", "/system/etc/init/init.kpatch.rc",
+	"/system/app/Magisk", "/cache/magisk.log", "/data/magisk",
 	"/data/data/com.topjohnwu.magisk",
 	"/data/user/0/com.topjohnwu.magisk",
 	"/data/user_de/0/com.topjohnwu.magisk",
@@ -521,14 +532,16 @@ static const char *const hidden[] = {
 	"/data/user/0/me.bmax.apatch",
 	"/data/user_de/0/me.bmax.apatch",
 	"/data/local/tmp", "/proc/config.gz", "/sys/module/nvsvc",
-	"/sys/class/misc/nvsvc", "/data/misc/.__np",
+	"/sys/class/misc/nvsvc", "/sys/module/kpatch",
+	"/sys/module/kernelpatch", "/data/misc/.__np",
 };
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
 static const char *const blk_name[] = {
-	"su", "magisk", "Magisk", "ksud", "apd", "adb", "kpatch",
+	"su", "magisk", "Magisk", "ksud", "apd", "adb", "kpatch", "kp",
 	"nvsvc", ".__np", ".magisk", ".ext", "debug_ramdisk",
-	"libnvsvc.so", "init.magisk.rc", "config.gz",
+	"libnvsvc.so", "init.magisk.rc", "init.kpatch.rc", "config.gz",
+	"zygisk", "zygiskd", "libzygisk.so", "libzygiskd.so",
 };
 #define BLK_N ARRAY_SIZE(blk_name)
 
@@ -541,7 +554,7 @@ static const char *const blk_pfx[] = {
 static const char *const blk_text[] = {
 	"kpatch", "APatch", "KernelSU", "magisk", "Magisk", "ksud", "apd",
 	"overlay", "nvsvc", ".__np", "debug_ramdisk", "libnvsvc",
-	"/data/adb", "/data/local/tmp",
+	"/data/adb", "/data/local/tmp", "zygisk", "Zygisk",
 	"com.topjohnwu.magisk", "me.weishu.kernelsu", "me.bmax.apatch",
 };
 #define BLK_T ARRAY_SIZE(blk_text)
@@ -672,8 +685,7 @@ static void uts_scrub(void)
 	c = v + strlen(v);
 	while (c > v && c[-1] == ' ') *--c = '\0';
 
-	/* APatch Full/LKM mode isi token se decide karta hai. Agar scrub ke
-	 * baad token gayab ho gaya ho to wapas likh do. */
+	/* APatch Full/LKM mode isi token se decide karta hai */
 	if (!strstr(v, "kpatch")) {
 		l = (long)strlen(v);
 		if (l + 8 < (long)sizeof(k_uts->name.version))
@@ -689,7 +701,7 @@ static void uts_restore(void)
 	uts_ok = 0;
 }
 
-/* ---------- manager uid detect ---------- */
+/* ---------- uid detect ---------- */
 static const char *const mgr_path[] = {
 	"/data/data/me.bmax.apatch",
 	"/data/data/me.weishu.kernelsu",
@@ -699,23 +711,39 @@ static const char *const mgr_path[] = {
 	"/data/adb/ksu",
 };
 
-/* inode->i_uid offset 4 par hai (i_mode u16, i_opflags u16, i_uid kuid_t) */
-static void detect_mgr_uid(void)
+static const char *const game_path[] = {
+	"/data/data/com.dts.freefireth",
+	"/data/data/com.dts.freefiremax",
+};
+
+/* inode->i_uid offset 4 (i_mode u16, i_opflags u16, kuid_t i_uid) */
+static unsigned int inode_uid(const char *path)
 {
 	struct kp_path p;
-	unsigned int i, uid;
+	unsigned int uid = 0;
 
-	if (!k_kern_path || !k_path_put) return;
-	for (i = 0; i < ARRAY_SIZE(mgr_path); i++) {
-		if (k_kern_path(mgr_path[i], LOOKUP_FOLLOW, &p)) continue;
-		if (kptr_ok(p.dentry) && kptr_ok(p.dentry->d_inode)) {
-			uid = *(unsigned int *)((char *)p.dentry->d_inode + 4);
-			if (uid > 0 && uid < 20000) mgr_uid = (int)uid;
-		}
-		k_path_put(&p);
-		if (mgr_uid > 0) break;
+	if (!k_kern_path || !k_path_put) return 0;
+	if (k_kern_path(path, LOOKUP_FOLLOW, &p)) return 0;
+	if (kptr_ok(p.dentry) && kptr_ok(p.dentry->d_inode))
+		uid = *(unsigned int *)((char *)p.dentry->d_inode + 4);
+	k_path_put(&p);
+	return (uid > 0 && uid < 20000) ? uid : 0;
+}
+
+static void detect_uids(void)
+{
+	unsigned int i, u;
+
+	for (i = 0; i < ARRAY_SIZE(mgr_path) && mgr_uid < 0; i++) {
+		u = inode_uid(mgr_path[i]);
+		if (u) mgr_uid = (int)u;
+	}
+	for (i = 0; i < ARRAY_SIZE(game_path) && game_uid < 0; i++) {
+		u = inode_uid(game_path[i]);
+		if (u) game_uid = (int)u;
 	}
 	if (mgr_uid > 0) pr_info("nvsvc: mgr uid %d\n", mgr_uid);
+	if (game_uid > 0) pr_info("nvsvc: game uid %d\n", game_uid);
 }
 
 /* ---------- bootloader / props ---------- */
@@ -927,19 +955,27 @@ static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct kp_file *f = (struct kp_file *)P_ARG0(regs);
 	int *mode = (int *)ri->data;
 	const char *n;
+	unsigned int len;
+
 	*mode = 0;
 	if (bypass() || !kptr_ok(f) || !kptr_ok(f->f_path.dentry)) return 0;
+
+	/* sasta prefilter: sirf cmdline(7) bootargs(8) current(7)
+	 * enforce(7) build.prop(10) hi aage jaate hain */
+	len = f->f_path.dentry->d_name.len;
+	if (len != 7 && len != 8 && len != 10) return 0;
+
 	n = f->f_path.dentry->d_name.name;
 	if (!kptr_ok(n)) return 0;
-	if (!strncmp(n, "bootargs", 8)) { *mode = 1; return 1; }
-	if (!strcmp(n, "build.prop")) { *mode = 2; return 1; }
-	if (!strcmp(n, "current")) {
+	if (len == 7 && !strcmp(n, "cmdline")) { *mode = 1; return 1; }
+	if (len == 8 && !strncmp(n, "bootargs", 8)) { *mode = 1; return 1; }
+	if (len == 10 && !strcmp(n, "build.prop")) { *mode = 2; return 1; }
+	if (len == 7 && !strcmp(n, "enforce")) { *mode = 4; return 1; }
+	if (len == 7 && !strcmp(n, "current")) {
 		const char *pn = kptr_ok(f->f_path.dentry->d_parent) ?
 			f->f_path.dentry->d_parent->d_name.name : NULL;
 		if (kptr_ok(pn) && !strcmp(pn, "attr")) { *mode = 3; return 1; }
-		return 0;
 	}
-	if (!strcmp(n, "enforce")) { *mode = 4; return 1; }
 	return 0;
 }
 
@@ -1234,6 +1270,7 @@ static int resolve_syms(void)
 	RS("kvfree", k_kvfree);
 	RS("access_process_vm", k_access_process_vm);
 	RS("no_llseek", k_no_llseek);
+	RS("flush_icache_range", k_flush_icache);
 	if (!k_copy_from_user) return -ESRCH;
 	return 0;
 }
@@ -1305,6 +1342,25 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		mgr_uid = v;
 		return 0;
 	}
+	if (cmd == OP_GUID) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		game_uid = v;
+		return 0;
+	}
+	if (cmd == OP_GBYP) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		game_byp = v;
+		return 0;
+	}
+	if (cmd == OP_OFF) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		if (v && !hooks_off) { hooks_remove(); hooks_off = 1; }
+		else if (!v && hooks_off) { hooks_off = 0; hooks_install(); }
+		return 0;
+	}
 	if (cmd == OP_ABI) {
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
@@ -1316,6 +1372,13 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
 		if (!k_uts) return 0;
 		if (v) uts_scrub(); else uts_restore();
+		return 0;
+	}
+	if (cmd == OP_FLUSH) {
+		unsigned long long r[2];
+		if (copy_from_user(&r, (void __user *)arg, sizeof(r))) return -EFAULT;
+		if (k_flush_icache && r[1] > r[0])
+			k_flush_icache((unsigned long)r[0], (unsigned long)r[1]);
 		return 0;
 	}
 
@@ -1394,8 +1457,15 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	} else if (cmd == OP_WRITE) {
 		if (copy_from_user(kbuf, (void __user *)(unsigned long)cm.buffer,
 				   (unsigned long)cm.size)) ret = -EFAULT;
-		else ret = k_access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
-					       (int)cm.size, FOLL_WRITE | FOLL_FORCE);
+		else {
+			ret = k_access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
+						  (int)cm.size, FOLL_WRITE | FOLL_FORCE);
+			/* code patch ke baad icache flush, warna stale
+			 * instruction chalta hai -> SIGILL */
+			if (ret > 0 && k_flush_icache)
+				k_flush_icache((unsigned long)cm.addr,
+					       (unsigned long)cm.addr + (unsigned long)ret);
+		}
 	} else ret = -EINVAL;
 
 	if (kbuf != (void *)small && k_kvfree) k_kvfree(kbuf);
@@ -1471,9 +1541,9 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	dev.fops = (const struct kp_fops *)fops_buf;
 	dev.mode = 0666;
 
-	/* hooks se pehle -- warna lookup khud redirect ho jayega */
+	/* hooks se pehle, warna lookup khud redirect ho jayega */
 	pick_fake_path();
-	detect_mgr_uid();
+	detect_uids();
 
 	if (k_misc_register && k_misc_deregister) {
 		r = k_misc_register(&dev);
@@ -1486,8 +1556,6 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 #if STAGE >= 2
 	if (k_uts) uts_scrub();
 	cmdline_scrub();
-	/* 1 = sirf CAP_SYSLOG (root) ko dikhe -- APatch kp/kpatchd isse
-	 * kallsyms padhta hai, 2 karne se wo bhi andha ho jata tha */
 	if (kptr_ok(k_kptr_restrict) && *k_kptr_restrict < 1) {
 		saved_kptr = *k_kptr_restrict;
 		kptr_saved = 1;
@@ -1511,6 +1579,7 @@ static long nvsvc_stop(void *__user reserved)
 	(void)reserved;
 	if (!inited) return 0;
 	inited = 0;
+	hooks_off = 0;
 	hooks_remove();
 	if (kptr_saved && kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
 	uts_restore();
