@@ -9,7 +9,7 @@ STAGE ?= 6
 CC = $(TARGET_COMPILE)gcc
 CFLAGS += -nostdinc -fno-pic -fno-PIC -fno-pie -fno-stack-protector
 CFLAGS += -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-exceptions
-CFLAGS += -DSTAGE=$(STAGE)
+CFLAGS += -fno-strict-aliasing -DSTAGE=$(STAGE)
 
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
@@ -23,3 +23,4 @@ Owner_By_ali.kpm: ${objs}
 	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -Talihidden.lds -c -O2 -o $@ $<
 clean:
 	rm -f *.kpm *.o
+.PHONY: all clean
