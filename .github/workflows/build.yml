@@ -7,7 +7,7 @@ jobs:
   kpm:
     runs-on: ubuntu-22.04
     env:
-      KP_REF: main
+      KP_REF: "v0.13.1"
       STAGE: "6"
     steps:
       - uses: actions/checkout@v4
