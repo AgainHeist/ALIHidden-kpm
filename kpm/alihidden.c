@@ -1,7 +1,7 @@
 // ============================================================
-//  DARKxKERNEL KPM  (wanbai)  v25  — FINAL / LOAD-SAFE
-//  ABI client ke saath byte-exact, koi client change nahi.
-//  Init fail-soft: hook/alloc fail ho to bhi load hota hai.
+//  DARKxKERNEL KPM  (wanbai)  v27  — FINAL / LOAD-SAFE / HIDDEN
+//  ABI client ke saath byte-exact. Har symbol fail-soft.
+//  fops version-free (dispatcher). Koi hard dependency nahi.
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -12,6 +12,7 @@
 #include <hook.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/list.h>
 #include <linux/fs.h>
 #include <linux/ptrace.h>
 #include <linux/uaccess.h>
@@ -28,7 +29,7 @@ extern unsigned int current_uid(void);
 #endif
 
 #ifndef STAGE
-#define STAGE 6
+#define STAGE 5
 #endif
 
 /* ============================================================
@@ -52,7 +53,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("25.0.0");
+KPM_VERSION("27.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -110,6 +111,12 @@ KPM_DESCRIPTION("system service");
 #endif
 #ifndef MISC_DYNAMIC_MINOR
 #define MISC_DYNAMIC_MINOR 255
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#  define KP_STATIC_ASSERT(c, m) _Static_assert(c, m)
+#else
+#  define KP_STATIC_ASSERT(c, m) typedef char __kpsa_##__LINE__[(c) ? 1 : -1]
 #endif
 
 #define USER_TOP 0x0001000000000000UL
@@ -190,8 +197,6 @@ struct kp_miscdevice {
 struct kp_seq_file { char *buf; size_t size; size_t from; size_t count; };
 struct kp_statfs { long f_type; long f_bsize; };
 
-/* mm_struct->mmap offset 0 (<=6.0). vma: vm_start 0, vm_end 8,
- * vm_next 0x10 (<=6.0). >=6.1 me mm->mmap field nahi, find_vma use. */
 struct kp_mm { void *head; };
 
 #define __NEW_UTS_LEN 64
@@ -227,8 +232,10 @@ static int  (*k_copy_from_user)(void *, const void __user *, unsigned long);
 static int  (*k_in_compat)(void);
 static int  *k_kptr_restrict;
 static char **k_saved_cmdline;
+static char *k_banner;
 static struct kp_utsns *k_uts;
 static void *(*k_find_vma)(void *, unsigned long);
+static void *(*k_find_vma_prev)(void *, unsigned long, void **);
 
 static int  (*k_input_event)(struct input_dev *, unsigned int, unsigned int, int);
 static int  (*k_input_mt_slot)(struct input_dev *, int);
@@ -252,8 +259,16 @@ static int user_ok(unsigned long a)
 	return a && a < USER_TOP;
 }
 
+static unsigned long sym_addr(const char *n)
+{
+	if (!kallsyms_lookup_name || !n) return 0;
+	return (unsigned long)kallsyms_lookup_name(n);
+}
+
+#define HAVE(s) sym_addr(s)
+
 /* ============================================================
- *  fops buffer
+ *  fops buffer — ek dispatcher, dono layouts cover
  * ============================================================ */
 #define FOPS_MAX 384
 static unsigned char fops_buf[FOPS_MAX] __attribute__((aligned(16)));
@@ -265,25 +280,15 @@ static void fops_put(unsigned int off, const void *fn)
 		*(const void **)(fops_buf + off) = fn;
 }
 
+static long dev_dispatch(struct kp_file *f, unsigned long a, unsigned long b);
+
 static void fops_layout(unsigned int maj, unsigned int min)
 {
-	unsigned long v = (unsigned long)maj * 100 + min;
 	unsigned int p = (unsigned int)sizeof(void *);
-
-	if (v >= 407) { poll_off = 9 * p;  uio_off = 10 * p; }
-	else          { poll_off = 7 * p;  uio_off = 8 * p; }
-	cio_off = uio_off + p;
-
-	if (uio_off + 2 * p > FOPS_MAX) {
-		poll_off = 9 * p;
-		uio_off = 10 * p;
-		cio_off = uio_off + p;
-	}
-	if (cio_off + p > FOPS_MAX) {
-		poll_off = 7 * p;
-		uio_off = 8 * p;
-		cio_off = uio_off + p;
-	}
+	(void)maj; (void)min;
+	poll_off = 7 * p;
+	uio_off = 8 * p;
+	cio_off = 9 * p;
 }
 
 /* ============================================================
@@ -397,8 +402,7 @@ static int register_kprobe(struct kprobe *p)
 {
 	unsigned long addr;
 	if (!p->symbol_name) return -EINVAL;
-	if (!kallsyms_lookup_name) return -ESRCH;
-	addr = kallsyms_lookup_name(p->symbol_name);
+	addr = sym_addr(p->symbol_name);
 	if (!addr) return -ESRCH;
 	p->addr = (void *)addr;
 	if (hook_wrap4(p->addr, kprobe_before, kprobe_after, p)) { p->addr = 0; return -EIO; }
@@ -418,8 +422,7 @@ static int register_kretprobe(struct kretprobe *kr)
 	unsigned long addr;
 	if (!kr->kp.symbol_name) return -EINVAL;
 	if (kr->data_size > KRET_BODY_MAX) return -E2BIG;
-	if (!kallsyms_lookup_name) return -ESRCH;
-	addr = kallsyms_lookup_name(kr->kp.symbol_name);
+	addr = sym_addr(kr->kp.symbol_name);
 	if (!addr) return -ESRCH;
 	kr->kp.addr = (void *)addr;
 	if (hook_wrap4(kr->kp.addr, kret_before, kret_after, kr)) { kr->kp.addr = 0; return -EIO; }
@@ -535,6 +538,9 @@ static int bypass(void)
 
 /* ============================================================
  *  REWRITE LIST
+ *  NOTE: /dev/wanbai aur /proc/misc yahan NAHI hain — unka open
+ *  rewrite ho jata to client EISDIR khata. Unko listing/seq
+ *  filter se hide karte hain.
  * ============================================================ */
 static const char *const hidden[] = {
 	"/sbin/su", "/system/bin/su", "/system/xbin/su",
@@ -797,8 +803,7 @@ static int learner_install(void)
 {
 	unsigned long a;
 	if (inj_addr) return 0;
-	if (!kallsyms_lookup_name) return -ESRCH;
-	a = kallsyms_lookup_name("input_event");
+	a = sym_addr("input_event");
 	if (!a) return -ESRCH;
 	if (hook_wrap4((void *)a, learn_before, learn_after, 0)) return -EIO;
 	inj_addr = (void *)a;
@@ -849,8 +854,15 @@ static int kver_mm(unsigned int *maj, unsigned int *min)
 {
 	const char *p;
 	unsigned int a = 0, b = 0;
-	if (!kptr_ok(k_uts)) return -1;
-	p = k_uts->name.release;
+
+	if (k_banner && kptr_ok(k_banner) && !strncmp(k_banner, "Linux version ", 14)) {
+		p = k_banner + 14;
+	} else if (kptr_ok(k_uts)) {
+		p = k_uts->name.release;
+	} else {
+		return -1;
+	}
+
 	while (*p >= '0' && *p <= '9') a = a * 10 + (unsigned int)(*p++ - '0');
 	if (*p != '.') return -1;
 	p++;
@@ -1110,6 +1122,7 @@ static void scrub_ctx(char *c)
 
 /* ---------- getname ---------- */
 struct gp_data { char path[PATH_S]; int hide; int guard; };
+KP_STATIC_ASSERT(sizeof(struct gp_data) <= KRET_BODY_MAX, "gp_data too big");
 
 static struct kretprobe kr_name = {
 	.kp.symbol_name = "getname_flags",
@@ -1162,10 +1175,11 @@ static int pre_path(struct kprobe *p, struct pt_regs *regs)
 struct shadow {
 	struct kp_dir_context dc;
 	struct kp_dir_context *orig;
-	int pidonly;
-	int devdir;
-	int emitted;
+	char pidonly;
+	char devdir;
+	char emitted;
 };
+KP_STATIC_ASSERT(sizeof(struct shadow) <= 32, "shadow too big for hook local");
 
 static int is_dev_dir(unsigned long filep)
 {
@@ -1254,8 +1268,8 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	g_dir = 1;
 	s->orig = ctx;
 	memcpy(&s->dc, ctx, sizeof(*ctx));
-	s->pidonly = pidonly;
-	s->devdir = dev;
+	s->pidonly = (char)pidonly;
+	s->devdir = (char)dev;
 	s->emitted = 0;
 	s->dc.actor = (pidonly && !dev) ? filter_actor_pid : filter_actor;
 	f->arg1 = (unsigned long)&s->dc;
@@ -1387,6 +1401,8 @@ static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 #define TR_STATUS 2
 
 struct tr_data { struct kp_seq_file *m; long saved; int kind; int ok; };
+KP_STATIC_ASSERT(sizeof(struct tr_data) <= KRET_BODY_MAX, "tr_data too big");
+
 static struct kretprobe kr_mounts, kr_mountinfo, kr_modules, kr_misc;
 static struct kretprobe kr_fs, kr_vm, kr_status, kr_smaps, kr_maps, kr_roll;
 
@@ -1500,11 +1516,12 @@ static void hook_bprop(int on)
 static void hooks_install(void)
 {
 #if STAGE >= 3
-	kr_name.entry_handler = name_entry;
-	kr_name.handler = name_ret;
-	if (!register_kretprobe(&kr_name)) hooks_ok++;
-	else {
-		memset(&kr_name, 0, sizeof(kr_name));
+	if (HAVE("getname_flags")) {
+		kr_name.entry_handler = name_entry;
+		kr_name.handler = name_ret;
+		if (!register_kretprobe(&kr_name)) hooks_ok++;
+		else memset(&kr_name, 0, sizeof(kr_name));
+	} else if (HAVE("filename_lookup")) {
 		kp_path.symbol_name = "filename_lookup";
 		kp_path.pre_handler = pre_path;
 		if (!register_kprobe(&kp_path)) hooks_ok++;
@@ -1512,38 +1529,44 @@ static void hooks_install(void)
 #endif
 
 #if STAGE >= 4
-	kr_pread.data_size = sizeof(int);
-	kr_pread.entry_handler = pre_read;
-	kr_pread.handler = post_read;
-	hook_tr(&kr_pread, "proc_reg_read", TR_TEXT);
+	if (HAVE("proc_reg_read")) {
+		kr_pread.data_size = sizeof(int);
+		kr_pread.entry_handler = pre_read;
+		kr_pread.handler = post_read;
+		hook_tr(&kr_pread, "proc_reg_read", TR_TEXT);
+	}
 	hook_bprop(vfs_on);
 
-	kr_statfs.kp.symbol_name = "vfs_statfs";
-	kr_statfs.data_size = 0;
-	kr_statfs.entry_handler = entry_statfs;
-	kr_statfs.handler = post_statfs;
-	kr_statfs.maxactive = 64;
-	if (!register_kretprobe(&kr_statfs)) hooks_ok++;
-	else memset(&kr_statfs, 0, sizeof(kr_statfs));
+	if (HAVE("vfs_statfs")) {
+		kr_statfs.kp.symbol_name = "vfs_statfs";
+		kr_statfs.data_size = 0;
+		kr_statfs.entry_handler = entry_statfs;
+		kr_statfs.handler = post_statfs;
+		kr_statfs.maxactive = 64;
+		if (!register_kretprobe(&kr_statfs)) hooks_ok++;
+		else memset(&kr_statfs, 0, sizeof(kr_statfs));
+	}
 
-	kr_rl.kp.symbol_name = "vfs_readlink";
-	kr_rl.data_size = sizeof(int);
-	kr_rl.entry_handler = pre_rl;
-	kr_rl.handler = post_rl;
-	kr_rl.maxactive = 64;
-	if (!register_kretprobe(&kr_rl)) hooks_ok++;
-	else memset(&kr_rl, 0, sizeof(kr_rl));
+	if (HAVE("vfs_readlink")) {
+		kr_rl.kp.symbol_name = "vfs_readlink";
+		kr_rl.data_size = sizeof(int);
+		kr_rl.entry_handler = pre_rl;
+		kr_rl.handler = post_rl;
+		kr_rl.maxactive = 64;
+		if (!register_kretprobe(&kr_rl)) hooks_ok++;
+		else memset(&kr_rl, 0, sizeof(kr_rl));
+	}
 #endif
 
 #if STAGE >= 5
-	iterate_addr = kallsyms_lookup_name ? kallsyms_lookup_name("iterate_dir") : 0;
+	iterate_addr = sym_addr("iterate_dir");
 	if (iterate_addr &&
 	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0))
 		hooks_ok++;
 	else
 		iterate_addr = 0;
 
-	piddir_addr = kallsyms_lookup_name ? kallsyms_lookup_name("proc_pid_readdir") : 0;
+	piddir_addr = sym_addr("proc_pid_readdir");
 	if (piddir_addr &&
 	    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1))
 		hooks_ok++;
@@ -1552,16 +1575,16 @@ static void hooks_install(void)
 #endif
 
 #if STAGE >= 6
-	hook_tr(&kr_mounts, "show_vfsmnt", TR_TEXT);
-	hook_tr(&kr_mountinfo, "show_mountinfo", TR_TEXT);
-	hook_tr(&kr_modules, "m_show", TR_TEXT);
-	hook_tr(&kr_misc, "misc_show", TR_TEXT);
-	hook_tr(&kr_fs, "filesystems_proc_show", TR_TEXT);
-	hook_tr(&kr_vm, "s_show", TR_TEXT);
-	hook_tr(&kr_status, "proc_pid_status", TR_STATUS);
-	hook_tr(&kr_maps, "show_map_vma", TR_MAPS);
-	hook_tr(&kr_smaps, "show_smap", TR_MAPS);
-	hook_tr(&kr_roll, "smaps_rollup_show", TR_MAPS);
+	if (HAVE("show_vfsmnt"))           hook_tr(&kr_mounts, "show_vfsmnt", TR_TEXT);
+	if (HAVE("show_mountinfo"))        hook_tr(&kr_mountinfo, "show_mountinfo", TR_TEXT);
+	if (HAVE("m_show"))                hook_tr(&kr_modules, "m_show", TR_TEXT);
+	if (HAVE("misc_show"))             hook_tr(&kr_misc, "misc_show", TR_TEXT);
+	if (HAVE("filesystems_proc_show")) hook_tr(&kr_fs, "filesystems_proc_show", TR_TEXT);
+	if (HAVE("s_show"))                hook_tr(&kr_vm, "s_show", TR_TEXT);
+	if (HAVE("proc_pid_status"))       hook_tr(&kr_status, "proc_pid_status", TR_STATUS);
+	if (HAVE("show_map_vma"))          hook_tr(&kr_maps, "show_map_vma", TR_MAPS);
+	if (HAVE("show_smap"))             hook_tr(&kr_smaps, "show_smap", TR_MAPS);
+	if (HAVE("smaps_rollup_show"))     hook_tr(&kr_roll, "smaps_rollup_show", TR_MAPS);
 #endif
 }
 
@@ -1601,15 +1624,19 @@ static void pick_fake_path(void)
 }
 
 /* ---------- symbols ---------- */
-#define RS(name, slot) do { *(void **)&(slot) = kallsyms_lookup_name ? \
-	(void *)kallsyms_lookup_name(name) : 0; \
+#define RS(name, slot) do { *(void **)&(slot) = (void *)sym_addr(name); \
 	if (!(slot)) miss_syms++; } while (0)
 
 static int resolve_syms(void)
 {
+	if (!kallsyms_lookup_name) return -ESRCH;
+
 	RS("_copy_from_user", k_copy_from_user);
 	if (!k_copy_from_user) { miss_syms--; RS("__arch_copy_from_user", k_copy_from_user); }
 	if (!k_copy_from_user) { miss_syms--; RS("__copy_from_user", k_copy_from_user); }
+	if (!k_copy_from_user) { miss_syms--; RS("copy_from_user", k_copy_from_user); }
+
+	RS("linux_banner", k_banner);
 	RS("kptr_restrict", k_kptr_restrict);
 	RS("saved_command_line", k_saved_cmdline);
 	RS("init_uts_ns", k_uts);
@@ -1630,12 +1657,14 @@ static int resolve_syms(void)
 	RS("no_llseek", k_no_llseek);
 	RS("flush_icache_range", k_flush_icache);
 	RS("find_vma", k_find_vma);
+	if (!k_find_vma) { miss_syms--; RS("find_vma_prev", k_find_vma_prev); }
 	RS("input_event", k_input_event);
 	RS("input_mt_slot", k_input_mt_slot);
 	RS("input_mt_report_slot_state", k_input_mt_report_slot_state);
 	RS("input_mt_get_slot_by_key", k_input_mt_get_slot_by_key);
 	RS("input_sync", k_input_sync);
-	if (!k_copy_from_user) return -ESRCH;
+
+	if (!k_copy_from_user) pr_info("wanbai: copy_from_user missing, ioctl degraded\n");
 	return 0;
 }
 
@@ -1651,7 +1680,7 @@ static struct task_struct *task_get(int pid)
 static void task_put(struct task_struct *t) { if (t && k_put_task_struct) k_put_task_struct(t); }
 
 /* ============================================================
- *  chunked r/w  (plain flag — koi atomic libcall nahi)
+ *  chunked r/w
  * ============================================================ */
 static char *kmem_buf;
 static volatile int kmem_busy;
@@ -1739,7 +1768,6 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	c32 = abi_force >= 0 ? abi_force : (k_in_compat ? (k_in_compat() ? 1 : 0) : 0);
 	memset(&cm, 0, sizeof(cm));
 
-	/* client compat: init_key() -> 0 */
 	if (cmd == OP_INIT) return 0;
 	if (!user_ok(arg)) return 0;
 
@@ -1900,7 +1928,7 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	if (cmd == OP_BASE) {
 		struct mod_base mb;
 		struct kp_mm *mm;
-		void *vma;
+		void *vma, *prev;
 		char pname[256];
 		unsigned long long found = 0;
 		int guard = 0;
@@ -1924,7 +1952,9 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		task_put(tsk);
 		if (!mm) return -ESRCH;
 
+		prev = NULL;
 		if (k_find_vma) vma = k_find_vma(mm, 0);
+		else if (k_find_vma_prev) vma = k_find_vma_prev(mm, 0, &prev);
 		else vma = *(void **)mm;
 
 		while (kptr_ok(vma) && guard++ < 8192) {
@@ -1940,6 +1970,7 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 				if (kptr_ok(dn) && strstr(dn, pname)) { found = vstart; break; }
 			}
 			if (k_find_vma) vma = k_find_vma(mm, vend);
+			else if (k_find_vma_prev) { prev = NULL; vma = k_find_vma_prev(mm, vend, &prev); }
 			else vma = *(void **)((char *)vma + 0x10);
 		}
 		if (k_mmput) k_mmput(mm);
@@ -1990,6 +2021,14 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	return -EINVAL;
 }
 
+/* poll + unlocked_ioctl + compat_ioctl — ek hi entry.
+ * poll ka 2nd arg kernel pointer hota hai, ioctl ka cmd chhota int. */
+static long dev_dispatch(struct kp_file *f, unsigned long a, unsigned long b)
+{
+	if (a >= 0xffff000000000000UL) return 1;
+	return dev_ioctl(f, (unsigned int)a, b);
+}
+
 static loff_t dev_noop_llseek(struct kp_file *f, loff_t o, int w)
 { (void)f; (void)w; return o; }
 
@@ -1998,9 +2037,6 @@ static ssize_t dev_read(struct kp_file *f, char __user *b, size_t n, loff_t *p)
 
 static ssize_t dev_write(struct kp_file *f, const char __user *b, size_t n, loff_t *p)
 { (void)f; (void)b; (void)n; (void)p; return 0; }
-
-static unsigned int dev_poll(struct kp_file *f, void *t)
-{ (void)f; (void)t; return 1u; }
 
 static struct kp_miscdevice dev;
 
@@ -2018,7 +2054,7 @@ KPM_CTL0(owner_ctl);
 
 static long nvsvc_start(const char *args, const char *event, void *__user reserved)
 {
-	unsigned int maj = 0, min = 0;
+	unsigned int maj = 0, min = 0, i;
 	int r;
 
 	(void)args; (void)event; (void)reserved;
@@ -2028,24 +2064,21 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 		return -EIO;
 	}
 
-	/* dmesg filter sabse pehle (fail ho to bhi chalega) */
-	kr_kmsg.kp.symbol_name = "devkmsg_read";
-	kr_kmsg.data_size = sizeof(int);
-	kr_kmsg.entry_handler = kmsg_entry;
-	kr_kmsg.handler = kmsg_ret;
-	kr_kmsg.maxactive = 32;
-	if (!register_kretprobe(&kr_kmsg)) hooks_ok++;
-	else memset(&kr_kmsg, 0, sizeof(kr_kmsg));
-
-	r = resolve_syms();
-	if (r) {
-		pr_info("wanbai: copy_from_user missing, r=%d\n", r);
-		goto err;
+	if (HAVE("devkmsg_read")) {
+		kr_kmsg.kp.symbol_name = "devkmsg_read";
+		kr_kmsg.data_size = sizeof(int);
+		kr_kmsg.entry_handler = kmsg_entry;
+		kr_kmsg.handler = kmsg_ret;
+		kr_kmsg.maxactive = 32;
+		if (!register_kretprobe(&kr_kmsg)) hooks_ok++;
+		else memset(&kr_kmsg, 0, sizeof(kr_kmsg));
 	}
 
-	if (kver_mm(&maj, &min)) {
-		maj = 5; min = 10;
-	} else if (maj < 3 || (maj == 3 && min < 18)) {
+	r = resolve_syms();
+	if (r) { pr_info("wanbai: kallsyms missing\n"); goto err; }
+
+	if (kver_mm(&maj, &min)) { maj = 0; min = 0; pr_info("wanbai: kver unknown\n"); }
+	else if (maj < 3 || (maj == 3 && min < 18)) {
 		pr_info("wanbai: kernel %u.%u bahut purana\n", maj, min);
 		r = -EINVAL;
 		goto err;
@@ -2060,9 +2093,8 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 		 (const void *)(k_no_llseek ? k_no_llseek : dev_noop_llseek));
 	fops_put(2 * sizeof(void *), (const void *)dev_read);
 	fops_put(3 * sizeof(void *), (const void *)dev_write);
-	fops_put(poll_off, (const void *)dev_poll);
-	fops_put(uio_off, (const void *)dev_ioctl);
-	fops_put(cio_off, (const void *)dev_ioctl);
+	/* 7..11 = dispatcher: purana (<=4.6) aur naya layout dono cover */
+	for (i = 7; i <= 11; i++) fops_put(i * sizeof(void *), (const void *)dev_dispatch);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
@@ -2089,7 +2121,6 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	learner_install();
 #endif
 
-	/* 4 se kam hook = kuch missing; log dikhne do */
 	if (hooks_ok < 4) dmesg_hide = 0;
 
 	inited = 1;
