@@ -1,32 +1,23 @@
 ifndef TARGET_COMPILE
     $(error TARGET_COMPILE not set)
 endif
-
 ifndef KP_DIR
     KP_DIR = ../kp
 endif
 
 CC = $(TARGET_COMPILE)gcc
-LD = $(TARGET_COMPILE)ld
-
-CFLAGS += -nostdinc
-CFLAGS += -fno-pic -fno-PIC -fno-pie -fno-stack-protector
+CFLAGS += -nostdinc -fno-pic -fno-PIC -fno-pie -fno-stack-protector
 CFLAGS += -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-exceptions
 
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
-objs := alihidden.o
+objs := dkx.o
 
-all: alihidden.kpm
-
-alihidden.kpm: ${objs}
+all: dkx.kpm
+dkx.kpm: ${objs}
 	${CC} -r -o $@ $^
-
 %.o: %.c
-	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -Talihidden.lds -c -O2 -o $@ $<
-
-.PHONY: clean
+	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -Tdkx.lds -c -O2 -o $@ $<
 clean:
-	rm -f *.kpm
-	find . -name "*.o" | xargs rm -f
+	rm -f *.kpm *.o
