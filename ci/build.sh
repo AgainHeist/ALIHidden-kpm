@@ -1,23 +1,16 @@
 #!/bin/bash
 set -e
 
-echo "::group::fetch KernelPatch"
+# APatch app me jo KernelPatch version dikhta hai, wahi yahan daal
+# (ya dmesg | grep 'Kernel Patch Version' ka tag). Default latest.
+KP_REF="${KP_REF:-main}"
+
+echo "::group::fetch KernelPatch ($KP_REF)"
 git clone --quiet https://github.com/bmax121/KernelPatch.git kp
 cd kp
-
-PICK=$(git log --all --format=%H -- '*kputils.h' | head -n 1)
-if [ -z "$PICK" ]; then PICK=$(git tag --sort=v:refname | head -n 1); fi
-
-if [ -n "$PICK" ]; then
-    echo "checkout: $PICK"
-    git checkout --quiet "$PICK"
-else
-    echo "koi purana ref nahi mila, HEAD par build"
-fi
-
-ls -l kernel/include/kputils.h kernel/include/kpmodule.h || true
-echo "--- kputils.h location ---"
-find . -name 'kputils.h' | head
+git checkout --quiet "$KP_REF" || { echo "ref $KP_REF nahi mila"; exit 1; }
+echo "KP commit: $(git rev-parse --short HEAD)"
+ls -l kernel/include/kputils.h kernel/include/kpmodule.h
 cd ..
 echo "::endgroup::"
 
