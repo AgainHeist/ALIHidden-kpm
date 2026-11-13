@@ -1,12 +1,14 @@
 // ============================================================
-//  DARKxKERNEL KPM  (nvsvc)  v16  FULL-HIDE
-//  v16:
-//   - game bypass OFF by default -> Free Fire ko bhi poora hide
-//     (OP_GBYP se zarurat pade to bypass on kar sakte ho)
-//   - pre_read me qstr len prefilter -> har read par 1 load,
-//     game ke read path par koi jank/crash nahi
-//   - zygisk / kp / init.kpatch.rc bhi hidden
-//   - OP_FLUSH: panel multi-write ke baad ek baar flush kar sake
+//  DARKxKERNEL KPM  (nvsvc)  v17  FAST-HIDE
+//  v17:
+//   - hook recursion guard (depth) -> fault ke andar nested hook
+//     se stack udna band
+//   - is_hidden/name_blocked me first-char switch (90% lookup
+//     bina compare ke nikal jate hain)
+//   - name_entry me ek hi user-read (1-byte probe hata)
+//   - maps/smaps ke liye alag chhoti needle list + line len cap
+//   - TracerPid sirf status par, maps par nahi
+//   - magiskd / kpatchd bhi hidden
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -57,7 +59,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("15.0.0");
+KPM_VERSION("16.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -248,7 +250,6 @@ static struct kp_utsns *k_uts;
 	(k_copy_from_user ? k_copy_from_user((to), (from), (unsigned long)(n)) : -EFAULT)
 #define copy_to_user(to, from, n)   (compat_copy_to_user((to), (from), (int)(n)))
 #define strncpy_from_user(d, s, n)  (compat_strncpy_from_user((d), (s), (n)))
-#define kp_get_user_byte(dst, src)  copy_from_user((dst), (src), 1)
 
 static int kptr_ok(const void *p)
 {
@@ -470,7 +471,7 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_GBYP    0x80B
 #define OP_OFF     0x80C
 #define OP_FLUSH   0x80D
-#define API_VER    8
+#define API_VER    9
 #define MAX_IO     0x2000000
 #define SMALL_IO   512
 #define PATH_S     48
@@ -498,6 +499,7 @@ static int  mgr_uid = -1;
 static int  game_uid = -1;
 static int  game_byp;        /* default 0: game ko bhi poora hide */
 static int  hooks_off;
+static int  hook_depth;      /* recursion guard */
 static int  abi_force = -1;
 static unsigned int hooks_ok;
 static const char *fake_path = FAKE_FALL;
@@ -538,8 +540,8 @@ static const char *const hidden[] = {
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
 static const char *const blk_name[] = {
-	"su", "magisk", "Magisk", "ksud", "apd", "adb", "kpatch", "kp",
-	"nvsvc", ".__np", ".magisk", ".ext", "debug_ramdisk",
+	"su", "magisk", "Magisk", "magiskd", "ksud", "apd", "adb", "kpatch",
+	"kpatchd", "kp", "nvsvc", ".__np", ".magisk", ".ext", "debug_ramdisk",
 	"libnvsvc.so", "init.magisk.rc", "init.kpatch.rc", "config.gz",
 	"zygisk", "zygiskd", "libzygisk.so", "libzygiskd.so",
 };
@@ -551,6 +553,7 @@ static const char *const blk_pfx[] = {
 };
 #define BLK_PF ARRAY_SIZE(blk_pfx)
 
+/* poora set -- /proc/modules, /proc/misc, mounts, status */
 static const char *const blk_text[] = {
 	"kpatch", "APatch", "KernelSU", "magisk", "Magisk", "ksud", "apd",
 	"overlay", "nvsvc", ".__np", "debug_ramdisk", "libnvsvc",
@@ -559,14 +562,31 @@ static const char *const blk_text[] = {
 };
 #define BLK_T ARRAY_SIZE(blk_text)
 
+/* chhota set -- maps/smaps (hazaaron line) */
+static const char *const blk_maps[] = {
+	"overlay", "/data/adb", "nvsvc", "libnvsvc", "debug_ramdisk",
+	"/data/local/tmp", "zygisk", ".__np",
+};
+#define BLK_M ARRAY_SIZE(blk_maps)
+
 static int is_hidden(const char *p)
 {
+	const char *h;
 	unsigned int i;
 	long n;
+
 	if (!p || p[0] != '/') return 0;
+	switch (p[1]) {
+	case 'd': case 's': case 'v': case 'c': case 'p':
+		break;
+	default:
+		return 0;
+	}
 	for (i = 0; i < HIDDEN_N; i++) {
-		n = (long)strlen(hidden[i]);
-		if (!strncmp(p, hidden[i], n) && (p[n] == '\0' || p[n] == '/'))
+		h = hidden[i];
+		if (h[2] != p[2]) continue;
+		n = (long)strlen(h);
+		if (!strncmp(p, h, n) && (p[n] == '\0' || p[n] == '/'))
 			return 1;
 	}
 	return 0;
@@ -576,10 +596,19 @@ static int name_blocked(const char *n, int len)
 {
 	unsigned int i;
 	long l;
+
 	if (len <= 0 || len > 64) return 0;
-	for (i = 0; i < BLK_N; i++)
-		if ((int)strlen(blk_name[i]) == len && !memcmp(n, blk_name[i], len))
-			return 1;
+	switch (n[0]) {
+	case 's': case 'm': case 'M': case 'k': case 'a': case 'n':
+	case '.': case 'd': case 'l': case 'i': case 'c': case 'z':
+		break;
+	default:
+		return 0;
+	}
+	for (i = 0; i < BLK_N; i++) {
+		if ((int)strlen(blk_name[i]) != len) continue;
+		if (!memcmp(n, blk_name[i], len)) return 1;
+	}
 	for (i = 0; i < BLK_PF; i++) {
 		l = (long)strlen(blk_pfx[i]);
 		if ((long)len > l && !memcmp(n, blk_pfx[i], l)) return 1;
@@ -587,15 +616,16 @@ static int name_blocked(const char *n, int len)
 	return 0;
 }
 
-static int text_blocked(const char *s, long len)
+static int text_blocked_set(const char *s, long len, const char *const *set, int cnt)
 {
-	unsigned int i;
+	int i;
 	long n;
-	if (!len) return 0;
-	for (i = 0; i < BLK_T; i++) {
-		n = (long)strlen(blk_text[i]);
+
+	if (len <= 0) return 0;
+	for (i = 0; i < cnt; i++) {
+		n = (long)strlen(set[i]);
 		if (n > len) continue;
-		if (kp_memmem(s, len, blk_text[i], n)) return 1;
+		if (kp_memmem(s, len, set[i], n)) return 1;
 	}
 	return 0;
 }
@@ -849,7 +879,7 @@ static void scrub_ctx(char *c)
 }
 
 /* ---------- getname ---------- */
-struct gp_data { char path[PATH_S]; int hide; };
+struct gp_data { char path[PATH_S]; int hide; int guard; };
 
 static struct kretprobe kr_name = {
 	.kp.symbol_name = "getname_flags",
@@ -861,13 +891,16 @@ static int name_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gp_data *d = (struct gp_data *)ri->data;
 	const char __user *u = (const char __user *)P_ARG0(regs);
-	char c;
+
 	d->hide = 0;
+	d->guard = 0;
+	if (hook_depth) return 1;
 	if (bypass() || !u) return 1;
-	if (kp_get_user_byte(&c, u) || c != '/') return 1;
-	if (strncpy_from_user(d->path, u, sizeof(d->path) - 1) < 0) return 1;
+	hook_depth = 1;
+	d->guard = 1;
+	if (strncpy_from_user(d->path, u, sizeof(d->path) - 1) < 0) { d->path[0] = '\0'; return 1; }
 	d->path[sizeof(d->path) - 1] = '\0';
-	d->hide = is_hidden(d->path);
+	if (d->path[0] == '/') d->hide = is_hidden(d->path);
 	return 1;
 }
 
@@ -875,6 +908,7 @@ static int name_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct gp_data *d = (struct gp_data *)ri->data;
 	struct kp_filename *fn = (struct kp_filename *)P_RET(regs);
+	if (d->guard) hook_depth = 0;
 	if (!d->hide || !kptr_ok(fn) || IS_ERR(fn) || !kptr_ok(fn->name)) return 0;
 	kp_strscpy((char *)fn->name, fake_path, PATH_MAX);
 	return 0;
@@ -926,11 +960,13 @@ static void dir_before(hook_fargs4_t *f, void *ud)
 	int pidonly = (int)(unsigned long)ud;
 
 	F_FLAG = 0;
+	if (hook_depth) return;
 	if (bypass() || !kptr_ok(ctx) || !kptr_ok((const void *)ctx->actor)) return;
 	if ((void *)ctx->actor == (void *)filter_actor) return;
 	if ((void *)ctx->actor == (void *)filter_actor_pid) return;
 	if (pidonly && !hide_pid) return;
 
+	hook_depth = 1;
 	s->orig = ctx;
 	memcpy(&s->dc, ctx, sizeof(*ctx));
 	s->dc.actor = pidonly ? filter_actor_pid : filter_actor;
@@ -944,6 +980,7 @@ static void dir_after(hook_fargs4_t *f, void *ud)
 	struct shadow *s = (struct shadow *)F_BODY;
 	(void)ud;
 	if (!F_FLAG) return;
+	hook_depth = 0;
 	s->orig->pos = s->dc.pos;
 }
 
@@ -958,6 +995,7 @@ static int pre_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	unsigned int len;
 
 	*mode = 0;
+	if (hook_depth) return 0;
 	if (bypass() || !kptr_ok(f) || !kptr_ok(f->f_path.dentry)) return 0;
 
 	/* sasta prefilter: sirf cmdline(7) bootargs(8) current(7)
@@ -984,20 +1022,23 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	char __user *ub = (char __user *)P_ARG1(regs);
 	long ret = (long)regs_return_value(regs);
 	int mode = *(int *)ri->data;
-	char buf[512];
+	char buf[256];
 	long n;
+
 	if (!mode || ret <= 0 || !user_ok((unsigned long)ub)) return 0;
+	hook_depth = 1;
 	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
-	if (copy_from_user(buf, ub, n)) return 0;
+	if (copy_from_user(buf, ub, n)) { hook_depth = 0; return 0; }
 	buf[n] = '\0';
 	switch (mode) {
 	case 1: cmd_end = buf + n; scrub_boot_args(buf); cmd_end = NULL; break;
 	case 2: scrub_buildprop(buf); break;
 	case 3: scrub_ctx(buf); break;
 	case 4: if (buf[0] == '0') buf[0] = '1'; break;
-	default: return 0;
+	default: break;
 	}
 	copy_to_user(ub, buf, n);
+	hook_depth = 0;
 	return 0;
 }
 
@@ -1048,29 +1089,38 @@ static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 /* ---------- seq compaction ---------- */
-struct tr_data { struct kp_seq_file *m; long saved; int maps; int ok; };
+#define TR_TEXT 0
+#define TR_MAPS 1
+#define TR_STATUS 2
+
+struct tr_data { struct kp_seq_file *m; long saved; int kind; int ok; };
 static struct kretprobe kr_mounts, kr_mountinfo, kr_modules, kr_misc;
 static struct kretprobe kr_fs, kr_vm, kr_status, kr_smaps, kr_maps, kr_roll;
 
-static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+static int tr_entry_kind(struct kretprobe_instance *ri, struct pt_regs *regs, int kind)
 {
 	struct tr_data *d = (struct tr_data *)ri->data;
 	struct kp_seq_file *m = (struct kp_seq_file *)P_ARG0(regs);
-	d->m = m; d->saved = 0; d->maps = 0; d->ok = 0;
+
+	d->m = m; d->saved = 0; d->kind = kind; d->ok = 0;
+	if (hook_depth) return 0;
 	if (bypass() || !kptr_ok(m) || !kptr_ok(m->buf)) return 0;
 	if (m->size < 64 || m->size > 0x100000) return 0;
 	if (m->count > m->size) return 0;
+	hook_depth = 1;
 	d->saved = (long)m->count;
 	d->ok = 1;
 	return 1;
 }
 
+static int tr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{ return tr_entry_kind(ri, regs, TR_TEXT); }
+
 static int tr_entry_maps(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	int r = tr_entry(ri, regs);
-	((struct tr_data *)ri->data)->maps = 1;
-	return r;
-}
+{ return tr_entry_kind(ri, regs, TR_MAPS); }
+
+static int tr_entry_status(struct kretprobe_instance *ri, struct pt_regs *regs)
+{ return tr_entry_kind(ri, regs, TR_STATUS); }
 
 static void zero_tracer(char *buf, long start, long end)
 {
@@ -1089,7 +1139,7 @@ static void defang_perms(char *buf, long start, long end)
 	while (i < end) {
 		char *nl = memchr(buf + i, '\n', end - i);
 		long ll = nl ? (long)(nl - (buf + i)) + 1 : end - i;
-		char *sp = memchr(buf + i, ' ', ll);
+		char *sp = memchr(buf + i, ' ', ll < 64 ? ll : 64);
 		if (sp && (sp - buf) + 4 < i + ll && sp[1] == 'r' && sp[2] == 'w' && sp[3] == 'x')
 			sp[2] = '-';
 		i += ll;
@@ -1102,15 +1152,23 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct kp_seq_file *m = d->m;
 	long i, o, end;
 	(void)regs;
-	if (!d->ok || !kptr_ok(m) || (long)m->count <= d->saved) return 0;
+
+	if (!d->ok) return 0;
+	hook_depth = 0;
+	if (!kptr_ok(m) || (long)m->count <= d->saved) return 0;
 	if ((unsigned long)m->count > m->size) return 0;
-	zero_tracer(m->buf, d->saved, (long)m->count);
-	if (d->maps) defang_perms(m->buf, d->saved, (long)m->count);
+
+	if (d->kind == TR_STATUS) zero_tracer(m->buf, d->saved, (long)m->count);
+	if (d->kind == TR_MAPS) defang_perms(m->buf, d->saved, (long)m->count);
+
 	i = d->saved; end = (long)m->count; o = d->saved;
 	while (i < end) {
 		char *nl = memchr(m->buf + i, '\n', end - i);
 		long ll = nl ? (long)(nl - (m->buf + i)) + 1 : end - i;
-		if (text_blocked(m->buf + i, ll)) { i += ll; continue; }
+		int hit = (d->kind == TR_MAPS)
+			? text_blocked_set(m->buf + i, ll, blk_maps, BLK_M)
+			: text_blocked_set(m->buf + i, ll, blk_text, BLK_T);
+		if (hit) { i += ll; continue; }
 		if (o != i) memmove(m->buf + o, m->buf + i, ll);
 		o += ll; i += ll;
 	}
@@ -1118,10 +1176,14 @@ static int tr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-static void hook_tr(struct kretprobe *kr, const char *sym, int maps)
+static void hook_tr(struct kretprobe *kr, const char *sym, int kind)
 {
 	kr->kp.symbol_name = sym;
-	if (!kr->entry_handler) kr->entry_handler = maps ? tr_entry_maps : tr_entry;
+	if (!kr->entry_handler) {
+		if (kind == TR_MAPS) kr->entry_handler = tr_entry_maps;
+		else if (kind == TR_STATUS) kr->entry_handler = tr_entry_status;
+		else kr->entry_handler = tr_entry;
+	}
 	if (!kr->handler) kr->handler = tr_ret;
 	if (!kr->data_size) kr->data_size = sizeof(struct tr_data);
 	kr->maxactive = 64;
@@ -1151,8 +1213,8 @@ static void hooks_install(void)
 	kr_bprop.entry_handler = pre_read;
 	kr_pread.handler = post_read;
 	kr_bprop.handler = post_read;
-	hook_tr(&kr_pread, "proc_reg_read", 0);
-	hook_tr(&kr_bprop, "vfs_read", 0);
+	hook_tr(&kr_pread, "proc_reg_read", TR_TEXT);
+	hook_tr(&kr_bprop, "vfs_read", TR_TEXT);
 
 	kr_statfs.kp.symbol_name = "vfs_statfs";
 	kr_statfs.data_size = 0;
@@ -1190,16 +1252,16 @@ static void hooks_install(void)
 #endif
 
 #if STAGE >= 6
-	hook_tr(&kr_mounts, "show_vfsmnt", 0);
-	hook_tr(&kr_mountinfo, "show_mountinfo", 0);
-	hook_tr(&kr_modules, "m_show", 0);
-	hook_tr(&kr_misc, "misc_show", 0);
-	hook_tr(&kr_fs, "filesystems_proc_show", 0);
-	hook_tr(&kr_vm, "s_show", 0);
-	hook_tr(&kr_status, "proc_pid_status", 0);
-	hook_tr(&kr_maps, "show_map_vma", 1);
-	hook_tr(&kr_smaps, "show_smap", 1);
-	hook_tr(&kr_roll, "smaps_rollup_show", 1);
+	hook_tr(&kr_mounts, "show_vfsmnt", TR_TEXT);
+	hook_tr(&kr_mountinfo, "show_mountinfo", TR_TEXT);
+	hook_tr(&kr_modules, "m_show", TR_TEXT);
+	hook_tr(&kr_misc, "misc_show", TR_TEXT);
+	hook_tr(&kr_fs, "filesystems_proc_show", TR_TEXT);
+	hook_tr(&kr_vm, "s_show", TR_TEXT);
+	hook_tr(&kr_status, "proc_pid_status", TR_STATUS);
+	hook_tr(&kr_maps, "show_map_vma", TR_MAPS);
+	hook_tr(&kr_smaps, "show_smap", TR_MAPS);
+	hook_tr(&kr_roll, "smaps_rollup_show", TR_MAPS);
 	pr_info("nvsvc: stage6 %u\n", hooks_ok);
 #endif
 }
@@ -1317,7 +1379,6 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 	memset(&cm, 0, sizeof(cm));
 
 	if (cmd == OP_INIT) return 0;
-
 	if (!user_ok(arg)) return 0;
 
 	if (cmd == OP_VER) {
@@ -1460,8 +1521,6 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		else {
 			ret = k_access_process_vm(tsk, (unsigned long)cm.addr, kbuf,
 						  (int)cm.size, FOLL_WRITE | FOLL_FORCE);
-			/* code patch ke baad icache flush, warna stale
-			 * instruction chalta hai -> SIGILL */
 			if (ret > 0 && k_flush_icache)
 				k_flush_icache((unsigned long)cm.addr,
 					       (unsigned long)cm.addr + (unsigned long)ret);
@@ -1580,6 +1639,7 @@ static long nvsvc_stop(void *__user reserved)
 	if (!inited) return 0;
 	inited = 0;
 	hooks_off = 0;
+	hook_depth = 0;
 	hooks_remove();
 	if (kptr_saved && kptr_ok(k_kptr_restrict)) *k_kptr_restrict = saved_kptr;
 	uts_restore();
