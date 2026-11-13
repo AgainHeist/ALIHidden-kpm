@@ -1,12 +1,22 @@
-
 #!/bin/bash
 set -e
 
-git clone https://github.com/bmax121/KernelPatch.git kp
+echo "::group::fetch KernelPatch"
+git clone --quiet https://github.com/bmax121/KernelPatch.git kp
 cd kp
-git checkout "$(git log --before=2026-10-01 -1 --format=%H)"
+DEL=$(git log --diff-filter=D --format=%H -- kernel/include/kputils.h | head -n 1)
+echo "kputils.h delete commit: ${DEL:-none}"
+if [ -n "$DEL" ]; then
+    git checkout --quiet "${DEL}^"
+else
+    echo "kputils.h kabhi tha hi nahi, current HEAD par build"
+fi
+ls -l kernel/include/kputils.h kernel/include/kpmodule.h
 cd ..
+echo "::endgroup::"
 
-test -f kp/kernel/include/kputils.h
+echo "::group::build"
 make -C kpm KP_DIR="$PWD/kp" TARGET_COMPILE=aarch64-linux-gnu-
+echo "::endgroup::"
+
 ls -la kpm/*.kpm
