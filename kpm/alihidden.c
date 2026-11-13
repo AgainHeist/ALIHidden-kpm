@@ -1,7 +1,24 @@
 // ============================================================
-//  DARKxKERNEL KPM  (wanbai)  v28.3  — FINAL
+//  DARKxKERNEL KPM  (wanbai)  v31.0  — FINAL
+//
+//  ditPro ke dono KPM ki tarah: koi uid/app detect nahi,
+//  koi "sirf is app ke liye" shart nahi. Sab kuch hamesha on.
+//
+//  v31 (2nd + 3rd pass me mile bug):
+//   1. post_read: buf[320] par n 319 tak ja raha tha, par
+//      scrub_ctx "ksu" branch 1 byte grow karta hai -> 1 byte
+//      stack overflow. Ab n cap = sizeof(buf) - 8.
+//   2. set_bootstate red: room() tail+6 maang raha tha,
+//      zarurat tail+5 ki hai -> red case kabhi chalta hi nahi tha.
+//   3. set_verity: room() tail+10, "logging" (7) ke liye
+//      tail+9 chahiye -> logging case dead tha.
+//
+//  v30 se: koi uid detect nahi (bypass() turant 0, current_uid()
+//  call hi nahi), 2-phase hook install + live_probe() rollback.
+//  v29 se: hook local 48-byte cap + static assert, dmesg default
+//  off, fops 7..12, filter_actor duplicate d_off fix.
+//
 //  BTF offsets sirf "/" selftest pass hone par. Fail = defaults.
-//  Koi blind deref nahi. Load kabhi fail nahi hota.
 // ============================================================
 #include <ktypes.h>
 #include <compiler.h>
@@ -53,7 +70,7 @@ static int name_decode(void)
 }
 
 KPM_NAME("Owner By ali");
-KPM_VERSION("28.3.0");
+KPM_VERSION("31.0.0");
 KPM_LICENSE("GPL");
 KPM_AUTHOR("ali");
 KPM_DESCRIPTION("system service");
@@ -294,24 +311,23 @@ static unsigned int btf_type_len, btf_str_len;
 static int btf_parsed;
 static int btf_ok;
 
-/* har kind ka exact record size */
 static unsigned int btf_rec_size(const struct btf_type *t)
 {
 	unsigned int k = (t->info >> 24) & 0x1f;
 	unsigned int v = t->info & 0xffff;
 
 	switch (k) {
-	case 1:  return 12 + 4;             /* INT        */
-	case 3:  return 12 + 12;            /* ARRAY      */
-	case 4:                             /* STRUCT     */
-	case 5:  return 12 + v * 12;        /* UNION      */
-	case 6:  return 12 + v * 8;         /* ENUM       */
-	case 13: return 12 + v * 8;         /* FUNC_PROTO */
-	case 14: return 12 + 4;             /* VAR        */
-	case 15: return 12 + v * 12;        /* DATASEC    */
-	case 17: return 12 + 8;             /* DECL_TAG   */
-	case 19: return 12 + v * 12;        /* ENUM64     */
-	default: return 12;                 /* UNKN/PTR/FWD/TYPEDEF/CONST/VOLATILE/RESTRICT/FUNC/FLOAT/TYPE_TAG */
+	case 1:  return 12 + 4;
+	case 3:  return 12 + 12;
+	case 4:
+	case 5:  return 12 + v * 12;
+	case 6:  return 12 + v * 8;
+	case 13: return 12 + v * 8;
+	case 14: return 12 + 4;
+	case 15: return 12 + v * 12;
+	case 17: return 12 + 8;
+	case 19: return 12 + v * 12;
+	default: return 12;
 	}
 }
 
@@ -366,7 +382,6 @@ static unsigned int btf_struct_id(const char *name)
 	return 0;
 }
 
-/* offset bytes ya -1. need_ptr=1 par off+8 <= size bhi lazmi. */
 static int btf_member_off(unsigned int type_id, const char *name, int need_ptr)
 {
 	const struct btf_type *t;
@@ -433,7 +448,6 @@ struct koffs {
 	int idev_absbit, idev_absinfo, idev_node;
 };
 
-/* proven defaults — BTF fail par yahi rehte hain */
 static const struct koffs OFF_DEF = {
 	.vma_start     = 0,
 	.vma_end       = 8,
@@ -453,7 +467,6 @@ static const struct koffs OFF_DEF = {
 
 static struct koffs OFF;
 
-/* ---- accessors ---- */
 static struct kp_qstr *d_name_of(void *d)
 { return (struct kp_qstr *)((char *)d + OFF.dentry_name); }
 
@@ -476,7 +489,6 @@ static void *f_dentry_of(void *f)
 	return *(void **)((char *)p + OFF.path_dentry);
 }
 
-/* ---- selftest: offsets sirf tab rakho jab "/" par sach me chalein ---- */
 static int offs_selftest(void)
 {
 	struct kp_path p;
@@ -542,13 +554,11 @@ static void offs_resolve(void)
 		if ((v = btf_member_off(t, "vm_mm", 1))    >= 0) OFF.vma_mm    = v;
 	}
 
-	/* file->f_path sirf tab jab filp_open se verify ho sake */
 	if (k_filp_open && k_filp_close) {
 		t = btf_struct_id("file");
 		if (t && (v = btf_member_off(t, "f_path", 1)) >= 0) OFF.file_fpath = v;
 	}
 
-	/* struct path layout hamesha {mnt, dentry} — pin */
 	OFF.path_dentry = 8;
 
 	t = btf_struct_id("dentry");
@@ -628,10 +638,10 @@ struct kretprobe {
 #define regs_return_value(r) P_RET(r)
 #endif
 
+/* hook local buffer 6*8 = 48. F_FLAG data[0], F_BODY data+1 => 1+size <= 48 */
+#define KRET_BODY_MAX 48
 #define F_FLAG f->local.data[0]
 #define F_BODY ((void *)(f->local.data + 1))
-
-#define KRET_BODY_MAX 56
 
 #if defined(__aarch64__)
 static void regs_in(struct pt_regs *r, hook_fargs4_t *f)
@@ -729,7 +739,8 @@ static int register_kretprobe(struct kretprobe *kr)
 {
 	unsigned long addr;
 	if (!kr->kp.symbol_name) return -EINVAL;
-	if (kr->data_size > KRET_BODY_MAX) return -E2BIG;
+	if (!kr->data_size) kr->data_size = sizeof(int);
+	if (kr->data_size + 1 > KRET_BODY_MAX) return -E2BIG;
 	addr = sym_addr(kr->kp.symbol_name);
 	if (!addr) return -ESRCH;
 	kr->kp.addr = (void *)addr;
@@ -797,11 +808,12 @@ static void *kp_memmem(const void *h, long hl, const void *n, long nl)
 #define OP_KPTR    0x81A
 #define OP_IHIDE   0x81B
 #define OP_ISTAT   0x81C
+#define OP_SAFE    0x81D
 #define API_VER    17
 #define SMALL_IO   512
 #define KMEM_CHUNK 1024
 #define KMEM_MAX   0x1000000
-#define PATH_S     48
+#define PATH_S     32
 #define FAKE_DIR   "/data/misc/.__np"
 #define FAKE_FALL  "/data/misc"
 
@@ -836,12 +848,20 @@ static char *cmd_end;
 
 static int g_name, g_read, g_seq, g_dir;
 
+/*
+ * ditPro ki tarah: koi uid detect nahi. mgr/game uid set hi nahi hain
+ * (dono -1) to yahan turant 0 -- current_uid() bhi call nahi hota.
+ * Sab kuch, sab uid ke liye, hamesha hide.
+ */
 static int bypass(void)
 {
 	unsigned int u;
-	if (strict == 2) return 1;
+
+	if (strict == 2) return 1;              /* zabardasti sab dikhao */
+	if (mgr_uid < 0 && game_uid < 0) return 0;
+
 	u = current_uid();
-	if (u == 0) return strict ? 0 : 1;
+	if (u == 0) return 0;
 	if (game_byp && game_uid > 0 && (int)u == game_uid) return 1;
 	return mgr_uid > 0 && (int)u == mgr_uid;
 }
@@ -863,7 +883,7 @@ static const char *const hidden[] = {
 #define HIDDEN_N ARRAY_SIZE(hidden)
 
 static const char *const blk_name[] = {
-	"su", "magisk", "Magisk", "magiskd", "ksud", "apd", "adb", "kpatch",
+	"su", "magisk", "Magisk", "magiskd", "ksud",<｜begin▁of▁sentence｜>Arg, "apd", "adb", "kpatch",
 	"kpatchd", "kp", "wanbai", ".__np", ".magisk", ".ext", "debug_ramdisk",
 	"libnvsvc.so", "init.magisk.rc", "init.kpatch.rc", "config.gz",
 	"zygisk", "zygiskd", "libzygisk.so", "libzygiskd.so", "tmp",
@@ -893,7 +913,6 @@ static const char *const blk_maps[] = {
 };
 #define BLK_M ARRAY_SIZE(blk_maps)
 
-/* ---------- pid set hide ---------- */
 #define HIDE_MAX 8
 static int hide_set[HIDE_MAX];
 static int hide_set_n;
@@ -1008,7 +1027,7 @@ static void blank_word(char *b, const char *w)
  * ============================================================ */
 #define KM_MAX 1024
 static struct kretprobe kr_kmsg;
-static int dmesg_hide = 1;
+static int dmesg_hide = 0;
 
 static int kmsg_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -1336,27 +1355,7 @@ static void uts_restore(void)
 	uts_ok = 0;
 }
 
-/* ---------- uid detect ---------- */
-static const char *const mgr_path[] = {
-	"/data/data/me.bmax.apatch",
-	"/data/user/0/me.bmax.apatch",
-	"/data/user_de/0/me.bmax.apatch",
-	"/data/data/me.bmax.apatch.debug",
-	"/data/data/com.topjohnwu.magisk",
-	"/data/user/0/com.topjohnwu.magisk",
-	"/data/data/me.weishu.kernelsu",
-	"/data/user/0/me.weishu.kernelsu",
-	"/data/data/com.dergoogler.mmrl",
-	"/data/user/0/com.dergoogler.mmrl",
-	"/data/adb/ap",
-	"/data/adb/ksu",
-};
-
-static const char *const game_path[] = {
-	"/data/data/com.dts.freefireth",
-	"/data/data/com.dts.freefiremax",
-};
-
+/* ---------- uid (sirf ioctl se, load par nahi) ---------- */
 static unsigned int inode_uid(const char *path)
 {
 	struct kp_path p;
@@ -1379,22 +1378,6 @@ static unsigned int inode_uid(const char *path)
 	return (uid > 0 && uid < 20000) ? uid : 0;
 }
 
-static void detect_uids(void)
-{
-	unsigned int i, u;
-
-	for (i = 0; i < ARRAY_SIZE(mgr_path) && mgr_uid < 0; i++) {
-		u = inode_uid(mgr_path[i]);
-		if (u) mgr_uid = (int)u;
-	}
-	for (i = 0; i < ARRAY_SIZE(game_path) && game_uid < 0; i++) {
-		u = inode_uid(game_path[i]);
-		if (u) game_uid = (int)u;
-	}
-	if (mgr_uid > 0) pr_info("wanbai: mgr uid %d\n", mgr_uid);
-	if (game_uid > 0) pr_info("wanbai: game uid %d\n", game_uid);
-}
-
 /* ---------- bootloader / props ---------- */
 static int room(char *p, long n)
 {
@@ -1413,7 +1396,8 @@ static void set_bootstate(char *c)
 	}
 	if (!strncmp(v, "red", 3)) {
 		tail = (long)strlen(v + 3);
-		if (!room(v, tail + 6)) return;
+		/* v+3+tail = NUL, write last byte v+tail+5 */
+		if (!room(v, tail + 5)) return;
 		memmove(v + 5, v + 3, tail + 1);
 		memcpy(v, "green", 5);
 	}
@@ -1438,15 +1422,19 @@ static void set_vbmeta(char *c)
 static void set_verity(char *c)
 {
 	char *p = strstr(c, "veritymode="), *v;
-	long tail;
+	long vlen, tail;
+
 	if (!p) return;
 	v = p + 11;
-	if (!strncmp(v, "disabled", 8) || !strncmp(v, "logging", 7)) {
-		tail = (long)strlen(v + 8);
-		if (!room(v, tail + 10)) return;
-		memmove(v + 9, v + 8, tail + 1);
-		memcpy(v, "enforcing", 9);
-	}
+	if (!strncmp(v, "disabled", 8)) vlen = 8;
+	else if (!strncmp(v, "logging", 7)) vlen = 7;
+	else return;
+
+	tail = (long)strlen(v + vlen);
+	/* last byte v+9+tail; cmd_end NUL+2 = v+vlen+tail+2 >= v+tail+9 */
+	if (!room(v, tail + 9)) return;
+	memmove(v + 9, v + vlen, tail + 1);
+	memcpy(v, "enforcing", 9);
 }
 
 static void set_selinux(char *c)
@@ -1457,7 +1445,7 @@ static void set_selinux(char *c)
 	v = p + 21;
 	if (strncmp(v, "permissive", 10)) return;
 	tail = (long)strlen(v + 10);
-	if (!room(v, tail + 11)) return;
+	if (!room(v, tail + 10)) return;
 	memcpy(v, "enforcing", 9);
 	memmove(v + 9, v + 10, tail + 1);
 }
@@ -1476,7 +1464,7 @@ static void cmdline_scrub(void)
 	c = *k_saved_cmdline;
 	if (!c || !kptr_ok(c)) return;
 	if (!strstr(c, "androidboot")) return;
-	cmd_end = c + strlen(c);
+	cmd_end = c + strlen(c) + 2;
 	scrub_boot_args(c);
 }
 
@@ -1515,7 +1503,7 @@ static void scrub_ctx(char *c)
 
 /* ---------- getname ---------- */
 struct gp_data { char path[PATH_S]; int hide; int guard; };
-KP_STATIC_ASSERT(sizeof(struct gp_data) <= KRET_BODY_MAX, "gp_data too big");
+KP_STATIC_ASSERT(sizeof(struct gp_data) + 1 <= KRET_BODY_MAX, "gp_data too big");
 
 static struct kretprobe kr_name = {
 	.kp.symbol_name = "getname_flags",
@@ -1572,7 +1560,7 @@ struct shadow {
 	char devdir;
 	char emitted;
 };
-KP_STATIC_ASSERT(sizeof(struct shadow) <= 32, "shadow too big for hook local");
+KP_STATIC_ASSERT(sizeof(struct shadow) + 1 <= KRET_BODY_MAX, "shadow too big for hook local");
 
 static int is_dev_dir(unsigned long filep)
 {
@@ -1601,7 +1589,6 @@ static bool filter_actor(struct kp_dir_context *c, const char *name, int namlen,
 	c->pos = off;
 
 	if (s->devdir) {
-		/* asli node mila to duplicate mat karo */
 		if (namlen == DEV_LEN && !memcmp(name, DEV_NAME, DEV_LEN)) {
 			s->emitted = 1;
 			o->pos = off;
@@ -1613,6 +1600,7 @@ static bool filter_actor(struct kp_dir_context *c, const char *name, int namlen,
 			s->emitted = 1;
 			o->pos = off;
 			o->actor(o, DEV_NAME, DEV_LEN, off, 0, 2);
+			off = o->pos;           /* asli entry ko agla off */
 		}
 		o->pos = off;
 		r = o->actor(o, name, namlen, off, ino, type);
@@ -1741,22 +1729,25 @@ static int post_read(struct kretprobe_instance *ri, struct pt_regs *regs)
 	char __user *ub = (char __user *)P_ARG1(regs);
 	long ret = (long)regs_return_value(regs);
 	int mode = *(int *)ri->data;
-	char buf[256];
+	char buf[320];
 	long n;
 
 	if (!mode || ret <= 0 || !user_ok((unsigned long)ub)) return 0;
 	g_read = 1;
-	n = ret > (long)sizeof(buf) - 1 ? (long)sizeof(buf) - 1 : ret;
+	/* 8 byte reserve: ksu/kernelsu/magisk branch 1-4 byte grow karte hain */
+	n = ret > (long)sizeof(buf) - 8 ? (long)sizeof(buf) - 8 : ret;
 	if (copy_from_user(buf, ub, n)) { g_read = 0; return 0; }
 	buf[n] = '\0';
+	cmd_end = buf + sizeof(buf);
 	switch (mode) {
-	case 1: cmd_end = buf + n; scrub_boot_args(buf); cmd_end = NULL; break;
+	case 1: scrub_boot_args(buf); break;
 	case 2: scrub_buildprop(buf); break;
 	case 3: scrub_ctx(buf); break;
 	case 4: if (buf[0] == '0') buf[0] = '1'; break;
 	case 5: scrub_tracer(buf, n); break;
 	default: break;
 	}
+	cmd_end = NULL;
 	copy_to_user(ub, buf, n);
 	g_read = 0;
 	return 0;
@@ -1814,7 +1805,7 @@ static int post_rl(struct kretprobe_instance *ri, struct pt_regs *regs)
 #define TR_STATUS 2
 
 struct tr_data { struct kp_seq_file *m; long saved; int kind; int ok; };
-KP_STATIC_ASSERT(sizeof(struct tr_data) <= KRET_BODY_MAX, "tr_data too big");
+KP_STATIC_ASSERT(sizeof(struct tr_data) + 1 <= KRET_BODY_MAX, "tr_data too big");
 
 static struct kretprobe kr_mounts, kr_mountinfo, kr_modules, kr_misc;
 static struct kretprobe kr_fs, kr_vm, kr_status, kr_smaps, kr_maps, kr_roll;
@@ -1926,7 +1917,76 @@ static void hook_bprop(int on)
 	}
 }
 
-static void hooks_install(void)
+/* ============================================================
+ *  live probe — hooks lagne ke baad VFS zinda hai ya nahi
+ * ============================================================ */
+static int live_probe(void)
+{
+	struct kp_path p;
+	void *d, *file, *fd2;
+	int ok = 1;
+
+	if (!k_kern_path || !k_path_put) return 1;
+
+	memset(&p, 0, sizeof(p));
+	if (k_kern_path("/", LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &p)) return 0;
+	d = *(void **)((char *)&p + OFF.path_dentry);
+	if (!kptr_ok(d)) ok = 0;
+
+	if (ok && k_filp_open && k_filp_close) {
+		file = k_filp_open("/", 0, 0);
+		if (!file || IS_ERR(file) || !kptr_ok(file)) {
+			ok = 0;
+		} else {
+			fd2 = f_dentry_of(file);
+			if (fd2 != d) ok = 0;
+			k_filp_close(file, 0);
+		}
+	}
+	k_path_put(&p);
+	return ok;
+}
+
+static void dir_hooks_install(void)
+{
+#if STAGE >= 5
+	if (!iterate_addr) {
+		iterate_addr = sym_addr("iterate_dir");
+		if (iterate_addr &&
+		    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0))
+			hooks_ok++;
+		else
+			iterate_addr = 0;
+	}
+	if (!piddir_addr) {
+		piddir_addr = sym_addr("proc_pid_readdir");
+		if (piddir_addr &&
+		    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1))
+			hooks_ok++;
+		else
+			piddir_addr = 0;
+	}
+#endif
+}
+
+static void dir_hooks_remove(void)
+{
+#if STAGE >= 5
+	if (iterate_addr) {
+		hook_unwrap((void *)iterate_addr, dir_before, dir_after);
+		iterate_addr = 0;
+		if (hooks_ok) hooks_ok--;
+	}
+	if (piddir_addr) {
+		hook_unwrap((void *)piddir_addr, dir_before, dir_after);
+		piddir_addr = 0;
+		if (hooks_ok) hooks_ok--;
+	}
+#endif
+}
+
+/* phase A — path + read scrub. Sabse pehle, phir probe. */
+static void hooks_install_a(void)
 {
 #if STAGE >= 3
 	if (HAVE("getname_flags")) {
@@ -1970,22 +2030,12 @@ static void hooks_install(void)
 		else memset(&kr_rl, 0, sizeof(kr_rl));
 	}
 #endif
+}
 
-#if STAGE >= 5
-	iterate_addr = sym_addr("iterate_dir");
-	if (iterate_addr &&
-	    !hook_wrap4((void *)iterate_addr, dir_before, dir_after, (void *)0))
-		hooks_ok++;
-	else
-		iterate_addr = 0;
-
-	piddir_addr = sym_addr("proc_pid_readdir");
-	if (piddir_addr &&
-	    !hook_wrap4((void *)piddir_addr, dir_before, dir_after, (void *)1))
-		hooks_ok++;
-	else
-		piddir_addr = 0;
-#endif
+/* phase B — dir hooks (sabse hot path), alag se, apne probe ke saath */
+static void hooks_install_b(void)
+{
+	dir_hooks_install();
 
 #if STAGE >= 6
 	if (HAVE("show_vfsmnt"))           hook_tr(&kr_mounts, "show_vfsmnt", TR_TEXT);
@@ -2003,10 +2053,7 @@ static void hooks_install(void)
 
 static void hooks_remove(void)
 {
-#if STAGE >= 5
-	if (iterate_addr) hook_unwrap((void *)iterate_addr, dir_before, dir_after);
-	if (piddir_addr) hook_unwrap((void *)piddir_addr, dir_before, dir_after);
-#endif
+	dir_hooks_remove();
 	if (kr_name.hooked) unregister_kretprobe(&kr_name);
 	if (kp_path.hooked) unregister_kprobe(&kp_path);
 	if (kr_pread.hooked) unregister_kretprobe(&kr_pread);
@@ -2329,6 +2376,12 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 		hook_bprop(vfs_on);
 		return 0;
 	}
+	if (cmd == OP_SAFE) {
+		int v;
+		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
+		if (v) dir_hooks_remove(); else dir_hooks_install();
+		return 0;
+	}
 	if (cmd == OP_OFF) {
 		int v;
 		if (copy_from_user(&v, (void __user *)arg, sizeof(v))) return -EFAULT;
@@ -2339,7 +2392,8 @@ static long dev_ioctl(struct kp_file *f, unsigned int cmd, unsigned long arg)
 			hooks_off = 1;
 		} else if (!v && hooks_off) {
 			hooks_off = 0;
-			hooks_install();
+			hooks_install_a();
+			hooks_install_b();
 			learner_install();
 		}
 		return 0;
@@ -2525,7 +2579,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	r = resolve_syms();
 	if (r) { pr_info("wanbai: kallsyms missing\n"); goto err; }
 
-	offs_resolve();          /* selftest yahin hota hai */
+	offs_resolve();
 
 	if (kver_mm(&maj, &min)) { maj = 0; min = 0; pr_info("wanbai: kver unknown\n"); }
 	else if (maj < 3 || (maj == 3 && min < 18)) {
@@ -2541,7 +2595,7 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 		 (const void *)(k_no_llseek ? k_no_llseek : dev_noop_llseek));
 	fops_put(2 * sizeof(void *), (const void *)dev_read);
 	fops_put(3 * sizeof(void *), (const void *)dev_write);
-	for (i = 7; i <= 11; i++) fops_put(i * sizeof(void *), (const void *)dev_dispatch);
+	for (i = 7; i <= 12; i++) fops_put(i * sizeof(void *), (const void *)dev_dispatch);
 
 	memset(&dev, 0, sizeof(dev));
 	dev.minor = MISC_DYNAMIC_MINOR;
@@ -2550,9 +2604,9 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 	dev.mode = 0600;
 
 	pick_fake_path();
-	detect_uids();
+	/* koi uid detect nahi -- ditPro ki tarah sabke liye on */
 
-	if (btf_ok) idev_selftest();   /* sirf verified BTF par */
+	if (btf_ok) idev_selftest();
 
 	if (k_misc_register && k_misc_deregister) {
 		r = k_misc_register(&dev);
@@ -2566,7 +2620,20 @@ static long nvsvc_start(const char *args, const char *event, void *__user reserv
 #endif
 
 #if STAGE >= 3
-	hooks_install();
+	/* ---- phase A: path + read scrub, phir live probe ---- */
+	hooks_install_a();
+	if (hooks_ok && !live_probe()) {
+		pr_info("wanbai: probe A fail -> hooks wapas\n");
+		hooks_remove();
+		hooks_ok = 0;
+	} else if (hooks_ok) {
+		/* ---- phase B: dir hooks, phir dobara probe ---- */
+		hooks_install_b();
+		if (!live_probe()) {
+			pr_info("wanbai: probe B fail -> dir hooks wapas\n");
+			dir_hooks_remove();
+		}
+	}
 	if (!inj_dev) learner_install();
 #endif
 
